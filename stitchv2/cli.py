@@ -40,6 +40,10 @@ def _parse_csv_ints(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
+def _parse_csv_floats(text: str) -> tuple[float, ...]:
+    return tuple(float(x.strip()) for x in str(text).split(",") if x.strip())
+
+
 def _parse_csv_strings(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
@@ -121,6 +125,12 @@ def _add_common_run_args(parser: argparse.ArgumentParser, *, require_n_founders:
         dest="calibrate_genotype_posteriors",
         action="store_false",
     )
+    parser.add_argument(
+        "--calibration-mode",
+        choices=["fixed", "masked_cv"],
+        default="fixed",
+        help="Posterior calibration mode. masked_cv tunes fixed calibration grids using available held-out genotype labels.",
+    )
     parser.add_argument("--genotype-posterior-temperature", type=float, default=0.35)
     parser.add_argument("--genotype-posterior-blend", type=float, default=0.35)
     parser.add_argument(
@@ -139,6 +149,31 @@ def _add_common_run_args(parser: argparse.ArgumentParser, *, require_n_founders:
     parser.add_argument("--calibration-use-optuna", action="store_true")
     parser.add_argument("--calibration-optuna-trials", type=int, default=20)
     parser.add_argument("--calibration-max-train-rows", type=int, default=750000)
+    parser.add_argument(
+        "--calibration-train-site-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of labeled SNPs used to fit learned calibration; the fitted calibrator is applied to all SNPs.",
+    )
+    parser.add_argument(
+        "--calibration-lightgbm-use-block-context",
+        action="store_true",
+        help="Enable the older local-context LightGBM stage before read/site-aware calibration.",
+    )
+    parser.add_argument(
+        "--calibration-lightgbm-use-fixed-stage0",
+        action="store_true",
+        help="Use fixed temperature/blend calibration before LightGBM; default keeps raw HMM GP as the learned-calibration input.",
+    )
+    parser.add_argument("--calibration-maf-bins", default="0,0.01,0.05,0.5")
+    parser.add_argument("--calibration-temperatures", default="0.15,0.25,0.35,0.5,0.75,1.0")
+    parser.add_argument("--calibration-blends", default="0,0.25,0.5,0.75,1")
+    parser.add_argument("--calibration-dosage-scales", default="0.75,1,1.25,1.5,2")
+    parser.add_argument("--calibration-dosage-offsets", default="-0.25,0,0.25")
+    parser.add_argument("--calibration-hwe-prior-weights", default="0,0.25,0.5,1")
+    parser.add_argument("--no-calibration-optimize-dosage-scale", dest="calibration_optimize_dosage_scale", action="store_false")
+    parser.add_argument("--calibration-hwe-weight", type=float, default=0.0)
+    parser.add_argument("--calibration-hwe-min-maf", type=float, default=0.05)
     parser.add_argument("--microarray-plink", default="", help="Optional PLINK prefix for hard microarray genotype evidence.")
     parser.add_argument("--microarray-generation-default", type=float, default=np.nan)
     parser.add_argument("--microarray-hard-call-weight", type=int, default=80)
@@ -150,11 +185,24 @@ def _add_common_run_args(parser: argparse.ArgumentParser, *, require_n_founders:
     parser.add_argument("--no-profile-memory", dest="profile_memory", action="store_false")
     parser.add_argument("--compression", default="zstd")
     parser.add_argument("--compression-level", type=int, default=6)
+    parser.add_argument("--pedigree", default="", help="Optional pedigree table (parquet/csv) with offspring and parent columns.")
+    parser.add_argument(
+        "--pedigree-mode",
+        choices=["off", "smooth", "kinship", "transmission"],
+        default="smooth",
+        help="Post-HMM pedigree mode: off, dosage smoothing, kinship fallback, or transmission message passing.",
+    )
     parser.add_argument("--pedigree-strength", type=float, default=0.0)
+    parser.add_argument("--pedigree-offspring-col", default="sample_id")
+    parser.add_argument("--pedigree-parent1-col", default="father_id")
+    parser.add_argument("--pedigree-parent2-col", default="mother_id")
+    parser.add_argument("--pedigree-iterations", type=int, default=4)
+    parser.add_argument("--pedigree-kinship-threshold", type=float, default=0.01)
     parser.set_defaults(
         profile_memory=True,
         fragment_rescale_read_likelihood=True,
         calibrate_genotype_posteriors=True,
+        calibration_optimize_dosage_scale=True,
         microarray_add_samples=True,
     )
 
@@ -215,6 +263,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         write_genotype_calls=args.write_genotype_calls,
         write_support_mask=args.write_support_mask,
         calibrate_genotype_posteriors=args.calibrate_genotype_posteriors,
+        calibration_mode=args.calibration_mode,
         genotype_posterior_temperature=args.genotype_posterior_temperature,
         genotype_posterior_blend=args.genotype_posterior_blend,
         genotype_call_mode=args.genotype_call_mode,
@@ -228,6 +277,18 @@ def cmd_run(args: argparse.Namespace) -> None:
         calibration_use_optuna=args.calibration_use_optuna,
         calibration_optuna_trials=args.calibration_optuna_trials,
         calibration_max_train_rows=args.calibration_max_train_rows,
+        calibration_train_site_fraction=args.calibration_train_site_fraction,
+        calibration_lightgbm_use_block_context=args.calibration_lightgbm_use_block_context,
+        calibration_lightgbm_use_fixed_stage0=args.calibration_lightgbm_use_fixed_stage0,
+        calibration_maf_bins=_parse_csv_floats(args.calibration_maf_bins),
+        calibration_temperatures=_parse_csv_floats(args.calibration_temperatures),
+        calibration_blends=_parse_csv_floats(args.calibration_blends),
+        calibration_dosage_scales=_parse_csv_floats(args.calibration_dosage_scales),
+        calibration_dosage_offsets=_parse_csv_floats(args.calibration_dosage_offsets),
+        calibration_hwe_prior_weights=_parse_csv_floats(args.calibration_hwe_prior_weights),
+        calibration_optimize_dosage_scale=args.calibration_optimize_dosage_scale,
+        calibration_hwe_weight=args.calibration_hwe_weight,
+        calibration_hwe_min_maf=args.calibration_hwe_min_maf,
         microarray_plink_path=(args.microarray_plink if args.microarray_plink else None),
         microarray_add_samples=args.microarray_add_samples,
         microarray_generation_default=(
@@ -256,13 +317,20 @@ def cmd_run(args: argparse.Namespace) -> None:
         profile_memory=args.profile_memory,
         compression=args.compression,
         compression_level=args.compression_level,
+        pedigree_mode=args.pedigree_mode,
         pedigree_strength=args.pedigree_strength,
+        pedigree_offspring_col=args.pedigree_offspring_col,
+        pedigree_parent1_col=args.pedigree_parent1_col,
+        pedigree_parent2_col=args.pedigree_parent2_col,
+        pedigree_iterations=args.pedigree_iterations,
+        pedigree_kinship_threshold=args.pedigree_kinship_threshold,
         founder=founder_cfg,
     )
     pipeline = StitchPipeline(config)
+    pedigree = _read_table(args.pedigree) if args.pedigree else None
     start = time.perf_counter()
     rss0 = _peak_rss_mb()
-    pipeline.prepare_inputs(samples, founder_panel=founder_panel)
+    pipeline.prepare_inputs(samples, pedigree=pedigree, founder_panel=founder_panel)
     elapsed = time.perf_counter() - start
     rss1 = _peak_rss_mb()
     summary = {
@@ -296,7 +364,20 @@ def cmd_run(args: argparse.Namespace) -> None:
         "profile_memory": bool(args.profile_memory),
         "write_support_mask": bool(args.write_support_mask),
         "microarray_plink": (args.microarray_plink if args.microarray_plink else None),
+        "pedigree": {
+            "path": (args.pedigree if args.pedigree else None),
+            "mode": args.pedigree_mode,
+            "strength": float(args.pedigree_strength),
+            "offspring_col": args.pedigree_offspring_col,
+            "parent1_col": args.pedigree_parent1_col,
+            "parent2_col": args.pedigree_parent2_col,
+            "iterations": int(args.pedigree_iterations),
+            "kinship_threshold": float(args.pedigree_kinship_threshold),
+        },
     }
+    pedigree_summary_path = Path(args.output_dir) / "pedigree_summary.json"
+    if pedigree_summary_path.exists():
+        summary["pedigree"]["summary"] = json.loads(pedigree_summary_path.read_text(encoding="utf-8"))
     dask_run_summary_path = Path(args.output_dir) / "dask_run_summary.json"
     if dask_run_summary_path.exists():
         summary["dask_runtime"] = json.loads(dask_run_summary_path.read_text(encoding="utf-8"))

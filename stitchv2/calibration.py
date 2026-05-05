@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
 import numpy as np
@@ -14,9 +15,14 @@ def _softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
 
 def posterior_confidence_metrics(posterior: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gp = posterior.astype(np.float32, copy=False)
-    max_prob = np.max(gp, axis=2)
-    top2 = np.partition(gp, kth=1, axis=2)[:, :, -2:]
-    margin = np.clip(top2[:, :, 1] - top2[:, :, 0], 0.0, 1.0).astype(np.float32, copy=False)
+    gp_finite = np.nan_to_num(gp, nan=0.0)
+    max_prob = np.max(gp_finite, axis=2)
+    if gp.shape[2] < 2:
+        margin = np.zeros(gp.shape[:2], dtype=np.float32)
+    else:
+        gp_for_rank = np.nan_to_num(gp, nan=-np.inf)
+        top2 = np.partition(gp_for_rank, kth=gp.shape[2] - 2, axis=2)[:, :, -2:]
+        margin = np.clip(top2[:, :, 1] - top2[:, :, 0], 0.0, 1.0).astype(np.float32, copy=False)
     entropy = -np.sum(gp * np.log(np.clip(gp, 1e-12, 1.0)), axis=2) / np.log(max(gp.shape[2], 2))
     return (
         max_prob.astype(np.float32, copy=False),
@@ -107,6 +113,644 @@ def genotype_call_from_posterior(
         keep &= prob >= float(call_correct_threshold)
     call = np.where(keep, call, int(no_call_value)).astype(np.int8, copy=False)
     return call
+
+
+def stitch_vcf_genotype_call_from_posterior(
+    posterior: np.ndarray,
+    *,
+    threshold: float = 0.9,
+    no_call_value: int = -1,
+) -> np.ndarray:
+    """Mirror STITCH's VCF GT writer: argmax GP, then no-call if max GP < threshold."""
+    return genotype_call_from_posterior(
+        posterior,
+        stitch_gp_threshold=float(threshold),
+        no_call_value=int(no_call_value),
+    )
+
+
+def _normalise_edges(edges: Sequence[float]) -> np.ndarray:
+    arr = np.asarray(list(edges), dtype=np.float32)
+    if arr.ndim != 1 or arr.size < 2:
+        raise ValueError("MAF bins must contain at least two edges.")
+    arr = np.unique(np.clip(arr, 0.0, 0.5)).astype(np.float32, copy=False)
+    if arr.size < 2:
+        raise ValueError("MAF bins collapse to fewer than two unique edges.")
+    if float(arr[0]) > 0.0:
+        arr = np.concatenate([np.asarray([0.0], dtype=np.float32), arr])
+    if float(arr[-1]) < 0.5:
+        arr = np.concatenate([arr, np.asarray([0.5], dtype=np.float32)])
+    return arr
+
+
+def _posterior_nll(gp: np.ndarray, truth: np.ndarray, *, min_prob: float = 1e-6) -> float:
+    y = truth.astype(np.int16, copy=False).reshape(-1)
+    p = gp.reshape(-1, gp.shape[-1])
+    valid = (y >= 0) & (y < p.shape[1])
+    if not np.any(valid):
+        return float("inf")
+    return float(-np.mean(np.log(np.clip(p[valid, y[valid]], float(min_prob), 1.0))))
+
+
+def _posterior_brier(gp: np.ndarray, truth: np.ndarray) -> float:
+    y = truth.astype(np.int16, copy=False).reshape(-1)
+    p = gp.reshape(-1, gp.shape[-1])
+    valid = (y >= 0) & (y < p.shape[1])
+    if not np.any(valid):
+        return float("inf")
+    one_hot = np.zeros((int(np.sum(valid)), p.shape[1]), dtype=np.float32)
+    one_hot[np.arange(one_hot.shape[0]), y[valid]] = 1.0
+    return float(np.mean((p[valid] - one_hot) ** 2))
+
+
+def _posterior_dosage_mse(gp: np.ndarray, truth: np.ndarray) -> float:
+    y = truth.astype(np.int16, copy=False)
+    valid = y >= 0
+    if not np.any(valid):
+        return float("inf")
+    axis = np.arange(gp.shape[2], dtype=np.float32)
+    ds = np.sum(gp * axis[None, None, :], axis=2)
+    return float(np.mean((ds[valid] - y[valid].astype(np.float32, copy=False)) ** 2))
+
+
+def _hwe_soft_penalty(
+    gp: np.ndarray,
+    *,
+    maf: np.ndarray,
+    hwe_weight: float,
+    hwe_min_maf: float,
+) -> float:
+    weight = float(hwe_weight)
+    if weight <= 0.0 or gp.shape[2] != 3:
+        return 0.0
+    maf_arr = maf.astype(np.float32, copy=False)
+    use = np.isfinite(maf_arr) & (maf_arr >= float(hwe_min_maf))
+    if not np.any(use):
+        return 0.0
+    geno_dist = np.nanmean(gp[:, use, :], axis=0)
+    p = np.clip((geno_dist[:, 1] + 2.0 * geno_dist[:, 2]) / 2.0, 1e-5, 1.0 - 1e-5)
+    q = 1.0 - p
+    expected = np.stack([q * q, 2.0 * p * q, p * p], axis=1).astype(np.float32, copy=False)
+    return float(weight * np.mean((geno_dist - expected) ** 2))
+
+
+def estimate_maf_from_truth_or_posterior(
+    *,
+    truth_genotype: np.ndarray | None,
+    posterior: np.ndarray,
+    train_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    gp = posterior.astype(np.float32, copy=False)
+    n_samples, n_positions = gp.shape[:2]
+    maf = np.full(n_positions, np.nan, dtype=np.float32)
+    if truth_genotype is not None:
+        truth = truth_genotype.astype(np.int16, copy=False)
+        if truth.shape != (n_samples, n_positions):
+            raise ValueError(f"truth_genotype shape {truth.shape} does not match posterior shape {(n_samples, n_positions)}")
+        valid = truth >= 0
+        if train_mask is not None:
+            tm = train_mask.astype(bool, copy=False)
+            if tm.shape != valid.shape:
+                raise ValueError(f"train_mask shape {tm.shape} does not match truth shape {valid.shape}")
+            valid &= tm
+        for j in range(n_positions):
+            m = valid[:, j]
+            if np.any(m):
+                af = float(np.mean(truth[m, j].astype(np.float32, copy=False)) / 2.0)
+                maf[j] = min(max(af, 0.0), 1.0 - max(af, 0.0))
+    fallback = compute_variant_maf_from_posterior(gp)
+    maf = np.where(np.isfinite(maf), maf, fallback)
+    return np.clip(maf, 0.0, 0.5).astype(np.float32, copy=False)
+
+
+def estimate_alt_af_from_truth_or_posterior(
+    *,
+    truth_genotype: np.ndarray | None,
+    posterior: np.ndarray,
+    train_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    gp = posterior.astype(np.float32, copy=False)
+    n_samples, n_positions = gp.shape[:2]
+    af = np.full(n_positions, np.nan, dtype=np.float32)
+    if truth_genotype is not None:
+        truth = truth_genotype.astype(np.int16, copy=False)
+        if truth.shape != (n_samples, n_positions):
+            raise ValueError(f"truth_genotype shape {truth.shape} does not match posterior shape {(n_samples, n_positions)}")
+        valid = truth >= 0
+        if train_mask is not None:
+            tm = train_mask.astype(bool, copy=False)
+            if tm.shape != valid.shape:
+                raise ValueError(f"train_mask shape {tm.shape} does not match truth shape {valid.shape}")
+            valid &= tm
+        for j in range(n_positions):
+            m = valid[:, j]
+            if np.any(m):
+                af[j] = float(np.mean(truth[m, j].astype(np.float32, copy=False)) / 2.0)
+    geno_axis = np.arange(gp.shape[2], dtype=np.float32)
+    ploidy = max(gp.shape[2] - 1, 1)
+    fallback = np.mean(np.sum(gp * geno_axis[None, None, :], axis=2), axis=0) / float(ploidy)
+    af = np.where(np.isfinite(af), af, fallback)
+    return np.clip(af, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def hwe_prior_from_alt_af(alt_af: np.ndarray, *, min_prob: float = 1e-6) -> np.ndarray:
+    p = np.clip(alt_af.astype(np.float32, copy=False), float(min_prob), 1.0 - float(min_prob))
+    q = 1.0 - p
+    prior = np.stack([q * q, 2.0 * p * q, p * p], axis=1).astype(np.float32, copy=False)
+    prior = np.clip(prior, float(min_prob), 1.0)
+    prior /= np.clip(np.sum(prior, axis=1, keepdims=True), 1e-12, None)
+    return prior.astype(np.float32, copy=False)
+
+
+def apply_hwe_prior_to_posterior(
+    posterior: np.ndarray,
+    *,
+    alt_af: np.ndarray,
+    prior_weight: float,
+    min_prob: float = 1e-6,
+) -> np.ndarray:
+    weight = float(prior_weight)
+    gp = posterior.astype(np.float32, copy=False)
+    if weight <= 0.0:
+        return gp
+    prior = hwe_prior_from_alt_af(alt_af, min_prob=float(min_prob))
+    log_gp = np.log(np.clip(gp, float(min_prob), 1.0))
+    log_prior = np.log(np.clip(prior[None, :, :], float(min_prob), 1.0))
+    out = np.exp(log_gp + weight * log_prior).astype(np.float32, copy=False)
+    out = np.clip(out, float(min_prob), 1.0)
+    out /= np.clip(np.sum(out, axis=2, keepdims=True), 1e-12, None)
+    return out.astype(np.float32, copy=False)
+
+
+def posterior_call_score(posterior: np.ndarray, *, mode: str = "log_max_gp") -> np.ndarray:
+    gp = posterior.astype(np.float32, copy=False)
+    conf, margin, entropy = posterior_confidence_metrics(gp)
+    mode_l = str(mode).lower()
+    if mode_l == "max_gp":
+        return conf.astype(np.float32, copy=False)
+    if mode_l == "log_max_gp":
+        return np.log(np.clip(conf, 1e-12, 1.0)).astype(np.float32, copy=False)
+    if mode_l == "margin":
+        return margin.astype(np.float32, copy=False)
+    if mode_l == "neg_entropy":
+        return (-entropy).astype(np.float32, copy=False)
+    if mode_l == "log_max_gp_minus_entropy":
+        return (np.log(np.clip(conf, 1e-12, 1.0)) - entropy).astype(np.float32, copy=False)
+    raise ValueError(f"Unknown call-score mode: {mode}")
+
+
+def _macro_f1_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    yt = y_true.astype(np.int16, copy=False).reshape(-1)
+    yp = y_pred.astype(np.int16, copy=False).reshape(-1)
+    classes = np.union1d(np.unique(yt), np.unique(yp))
+    vals = []
+    for cls in classes.tolist():
+        if cls < 0:
+            continue
+        tp = float(np.sum((yt == cls) & (yp == cls)))
+        fp = float(np.sum((yt != cls) & (yp == cls)))
+        fn = float(np.sum((yt == cls) & (yp != cls)))
+        denom = 2.0 * tp + fp + fn
+        vals.append(0.0 if denom <= 0.0 else (2.0 * tp / denom))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _balanced_accuracy_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    yt = y_true.astype(np.int16, copy=False).reshape(-1)
+    yp = y_pred.astype(np.int16, copy=False).reshape(-1)
+    vals = []
+    for cls in np.unique(yt).tolist():
+        if cls < 0:
+            continue
+        m = yt == cls
+        if np.any(m):
+            vals.append(float(np.mean(yp[m] == cls)))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _variant_hwe_deviation_from_posterior(posterior: np.ndarray, alt_af: np.ndarray) -> np.ndarray:
+    gp = posterior.astype(np.float32, copy=False)
+    obs = np.nanmean(gp, axis=0)
+    exp = hwe_prior_from_alt_af(alt_af)
+    return np.sqrt(np.mean((obs - exp) ** 2, axis=1)).astype(np.float32, copy=False)
+
+
+def compute_hwe_features_from_posterior(
+    posterior: np.ndarray,
+    *,
+    alt_af: np.ndarray | None = None,
+    min_expected: float = 1e-6,
+) -> dict[str, np.ndarray]:
+    """Compute diploid biallelic HWE diagnostics from posterior genotype counts.
+
+    The chi-square p-value uses the 1-df survival function, erfc(sqrt(x / 2)).
+    This keeps the feature dependency-free and stable for calibration models.
+    """
+    gp = posterior.astype(np.float32, copy=False)
+    n_positions = gp.shape[1]
+    if gp.shape[2] != 3:
+        nan = np.full(n_positions, np.nan, dtype=np.float32)
+        return {
+            "hwe_deviation": nan,
+            "hwe_chisq": nan,
+            "hwe_pvalue": nan,
+            "hwe_neg_log10_pvalue": nan,
+        }
+    if alt_af is None:
+        alt_af = estimate_alt_af_from_truth_or_posterior(truth_genotype=None, posterior=gp)
+    af = np.clip(alt_af.astype(np.float32, copy=False), 1e-6, 1.0 - 1e-6)
+    obs_counts = np.sum(gp, axis=0).astype(np.float32, copy=False)
+    n_eff = np.clip(np.sum(obs_counts, axis=1), float(min_expected), None)
+    expected = hwe_prior_from_alt_af(af) * n_eff[:, None]
+    chisq = np.sum(((obs_counts - expected) ** 2) / np.clip(expected, float(min_expected), None), axis=1)
+    pvalue = np.asarray([math.erfc(math.sqrt(max(float(x), 0.0) / 2.0)) for x in chisq], dtype=np.float32)
+    deviation = np.sqrt(np.mean(((obs_counts / n_eff[:, None]) - (expected / n_eff[:, None])) ** 2, axis=1))
+    neg_log10 = -np.log10(np.clip(pvalue, 1e-30, 1.0)).astype(np.float32, copy=False)
+    return {
+        "hwe_deviation": deviation.astype(np.float32, copy=False),
+        "hwe_chisq": chisq.astype(np.float32, copy=False),
+        "hwe_pvalue": pvalue.astype(np.float32, copy=False),
+        "hwe_neg_log10_pvalue": neg_log10.astype(np.float32, copy=False),
+    }
+
+
+def fit_no_call_thresholds_by_calibration_class(
+    *,
+    posterior: np.ndarray,
+    truth_genotype: np.ndarray,
+    train_mask: np.ndarray,
+    maf: np.ndarray | None = None,
+    alt_af: np.ndarray | None = None,
+    maf_bins: Sequence[float] = (0.0, 0.01, 0.05, 0.5),
+    entropy_bins: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.01),
+    hwe_deviation_bins: Sequence[float] = (0.0, 0.02, 0.05, 0.10, np.inf),
+    score_mode: str = "log_max_gp",
+    thresholds: Sequence[float] | None = None,
+    min_train_rows_per_class: int = 16,
+    min_call_rate: float = 0.05,
+    max_no_call_rate_per_variant: float = 1.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    gp = posterior.astype(np.float32, copy=False)
+    truth = truth_genotype.astype(np.int16, copy=False)
+    train = (truth >= 0) & train_mask.astype(bool, copy=False)
+    if truth.shape != gp.shape[:2] or train.shape != truth.shape:
+        raise ValueError("posterior, truth_genotype, and train_mask shapes are incompatible.")
+    if maf is None:
+        maf = estimate_maf_from_truth_or_posterior(truth_genotype=truth, posterior=gp, train_mask=train)
+    if alt_af is None:
+        alt_af = estimate_alt_af_from_truth_or_posterior(truth_genotype=truth, posterior=gp, train_mask=train)
+    maf_edges = _normalise_edges(maf_bins)
+    ent_edges = np.asarray(list(entropy_bins), dtype=np.float32)
+    hwe_edges = np.asarray(list(hwe_deviation_bins), dtype=np.float32)
+    _, _, entropy = posterior_confidence_metrics(gp)
+    mean_entropy = np.nanmean(entropy, axis=0).astype(np.float32, copy=False)
+    hwe_dev = _variant_hwe_deviation_from_posterior(gp, alt_af.astype(np.float32, copy=False))
+    maf_idx = np.digitize(np.clip(maf, 0.0, 0.5), maf_edges[1:-1], right=False)
+    ent_idx = np.digitize(mean_entropy, ent_edges[1:-1], right=False)
+    hwe_idx = np.digitize(hwe_dev, hwe_edges[1:-1], right=False)
+    n_ent = max(len(ent_edges) - 1, 1)
+    n_hwe = max(len(hwe_edges) - 1, 1)
+    class_id = (maf_idx.astype(np.int32) * n_ent * n_hwe + ent_idx.astype(np.int32) * n_hwe + hwe_idx.astype(np.int32)).astype(np.int32)
+    score = posterior_call_score(gp, mode=str(score_mode))
+    argmax = np.argmax(gp, axis=2).astype(np.int8, copy=False)
+    if thresholds is None:
+        finite_score = score[train]
+        if finite_score.size == 0:
+            thresholds_arr = np.asarray([-np.inf], dtype=np.float32)
+        else:
+            q = np.linspace(0.0, 0.95, 40, dtype=np.float32)
+            thresholds_arr = np.unique(np.quantile(finite_score, q).astype(np.float32))
+            thresholds_arr = np.concatenate([np.asarray([-np.inf], dtype=np.float32), thresholds_arr])
+    else:
+        thresholds_arr = np.asarray(list(thresholds), dtype=np.float32)
+    threshold_by_variant = np.full(gp.shape[1], -np.inf, dtype=np.float32)
+    rows: list[dict[str, object]] = []
+    global_thr = -np.inf
+    global_score = -np.inf
+    flat_train = train.reshape(-1)
+    if np.any(flat_train):
+        yt_all = truth.reshape(-1)[flat_train]
+        yp_all = argmax.reshape(-1)[flat_train]
+        sc_all = score.reshape(-1)[flat_train]
+        for thr in thresholds_arr.tolist():
+            keep = sc_all >= float(thr)
+            call_rate = float(np.mean(keep)) if keep.size else 0.0
+            if call_rate < float(min_call_rate) or not np.any(keep):
+                continue
+            f1 = _macro_f1_np(yt_all[keep], yp_all[keep])
+            bacc = _balanced_accuracy_np(yt_all[keep], yp_all[keep])
+            obj = 0.5 * f1 + 0.5 * bacc + 0.03 * call_rate
+            if np.isfinite(obj) and obj > global_score:
+                global_score = float(obj)
+                global_thr = float(thr)
+    for cls in np.unique(class_id).tolist():
+        cols = class_id == int(cls)
+        cls_train = train[:, cols]
+        n_train = int(np.sum(cls_train))
+        best_thr = float(global_thr)
+        best_obj = float(global_score)
+        best_call_rate = float("nan")
+        best_f1 = float("nan")
+        best_bacc = float("nan")
+        fallback = True
+        if n_train >= int(min_train_rows_per_class):
+            yt = truth[:, cols][cls_train]
+            yp = argmax[:, cols][cls_train]
+            sc = score[:, cols][cls_train]
+            sc_mat = score[:, cols]
+            train_mat = train[:, cols]
+            for thr in thresholds_arr.tolist():
+                if float(max_no_call_rate_per_variant) < 1.0:
+                    denom = np.sum(train_mat, axis=0)
+                    no_call = np.sum(train_mat & (sc_mat < float(thr)), axis=0)
+                    valid_denom = denom > 0
+                    if np.any(valid_denom):
+                        max_rate = float(np.max(no_call[valid_denom] / np.clip(denom[valid_denom], 1, None)))
+                        if max_rate > float(max_no_call_rate_per_variant):
+                            continue
+                keep = sc >= float(thr)
+                call_rate = float(np.mean(keep)) if keep.size else 0.0
+                if call_rate < float(min_call_rate) or not np.any(keep):
+                    continue
+                f1 = _macro_f1_np(yt[keep], yp[keep])
+                bacc = _balanced_accuracy_np(yt[keep], yp[keep])
+                obj = 0.5 * f1 + 0.5 * bacc + 0.03 * call_rate
+                if np.isfinite(obj) and obj > best_obj:
+                    best_thr = float(thr)
+                    best_obj = float(obj)
+                    best_call_rate = call_rate
+                    best_f1 = float(f1)
+                    best_bacc = float(bacc)
+                    fallback = False
+        threshold_by_variant[cols] = float(best_thr)
+        rows.append(
+            {
+                "class_id": int(cls),
+                "n_variants": int(np.sum(cols)),
+                "n_train_rows": int(n_train),
+                "threshold": float(best_thr),
+                "score_mode": str(score_mode),
+                "objective": float(best_obj),
+                "train_call_rate": float(best_call_rate),
+                "train_f1": float(best_f1),
+                "train_balanced_accuracy": float(best_bacc),
+                "fallback_to_global": bool(fallback),
+            }
+        )
+    meta = {
+        "status": "ok",
+        "score_mode": str(score_mode),
+        "global_threshold": float(global_thr),
+        "global_objective": float(global_score),
+        "maf_bins": maf_edges.tolist(),
+        "entropy_bins": ent_edges.tolist(),
+        "hwe_deviation_bins": hwe_edges.tolist(),
+        "max_no_call_rate_per_variant": float(max_no_call_rate_per_variant),
+        "classes": rows,
+    }
+    return threshold_by_variant.astype(np.float32, copy=False), meta
+
+
+def apply_no_call_thresholds_by_variant(
+    posterior: np.ndarray,
+    threshold_by_variant: np.ndarray,
+    *,
+    score_mode: str = "log_max_gp",
+    no_call_value: int = -1,
+    max_no_call_rate_per_variant: float = 1.0,
+) -> np.ndarray:
+    gp = posterior.astype(np.float32, copy=False)
+    thr = threshold_by_variant.astype(np.float32, copy=False)
+    if thr.shape[0] != gp.shape[1]:
+        raise ValueError(f"threshold_by_variant length {thr.shape[0]} does not match n_variants {gp.shape[1]}")
+    call = np.argmax(gp, axis=2).astype(np.int8, copy=False)
+    score = posterior_call_score(gp, mode=str(score_mode))
+    if float(max_no_call_rate_per_variant) < 1.0:
+        cap = float(np.clip(max_no_call_rate_per_variant, 0.0, 1.0))
+        capped = thr.copy()
+        max_missing = int(np.floor(cap * float(gp.shape[0])))
+        for j in range(gp.shape[1]):
+            sorted_score = np.sort(score[:, j])
+            if max_missing <= 0:
+                cap_threshold = float(sorted_score[0])
+            elif max_missing < sorted_score.shape[0]:
+                cap_threshold = float(sorted_score[max_missing])
+            else:
+                cap_threshold = np.inf
+            capped[j] = min(float(capped[j]), cap_threshold)
+        thr = capped
+    keep = score >= thr[None, :]
+    return np.where(keep, call, int(no_call_value)).astype(np.int8, copy=False)
+
+
+def masked_cv_calibrate_genotype_posterior(
+    *,
+    raw_posterior: np.ndarray | None,
+    dosage: np.ndarray,
+    truth_genotype: np.ndarray,
+    train_mask: np.ndarray | None = None,
+    depth: np.ndarray | None = None,
+    maf_bins: Sequence[float] = (0.0, 0.01, 0.05, 0.5),
+    temperatures: Sequence[float] = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0),
+    blends: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+    dosage_scales: Sequence[float] = (0.75, 1.0, 1.25, 1.5, 2.0),
+    dosage_offsets: Sequence[float] = (-0.25, 0.0, 0.25),
+    hwe_prior_weights: Sequence[float] = (0.0, 0.25, 0.5, 1.0),
+    optimize_dosage_scale: bool = True,
+    hwe_weight: float = 0.0,
+    hwe_min_maf: float = 0.05,
+    brier_weight: float = 0.25,
+    dosage_mse_weight: float = 0.10,
+    min_train_rows_per_bin: int = 16,
+    min_prob: float = 1e-6,
+    ploidy: int | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Tune fixed posterior calibration parameters on masked truth labels, stratified by MAF.
+
+    The function is intentionally dependency-free and conservative: it only uses labels marked by
+    ``train_mask`` to select calibration parameters, then applies the selected bin-specific
+    parameters to all samples for variants in that MAF bin.
+    """
+    ds = dosage.astype(np.float32, copy=False)
+    truth = truth_genotype.astype(np.int16, copy=False)
+    if truth.shape != ds.shape:
+        raise ValueError(f"truth_genotype shape {truth.shape} does not match dosage shape {ds.shape}")
+    ploidy_i = int(raw_posterior.shape[2] - 1) if raw_posterior is not None else (2 if ploidy is None else int(ploidy))
+    if ploidy_i != 2:
+        # The search objective currently assumes biallelic diploid hard labels 0/1/2.
+        base = calibrate_genotype_posterior(
+            raw_posterior,
+            dosage=ds,
+            depth=depth,
+            temperature=0.35,
+            blend=0.35,
+            min_prob=float(min_prob),
+            ploidy=ploidy_i,
+        )
+        return base, {"status": "skipped_non_diploid", "ploidy": int(ploidy_i)}
+
+    raw = (
+        dosage_to_genotype_posterior(ds, depth=depth, temperature=0.35, min_prob=float(min_prob), ploidy=2)
+        if raw_posterior is None
+        else raw_posterior.astype(np.float32, copy=False)
+    )
+    if raw.shape != (ds.shape[0], ds.shape[1], 3):
+        raise ValueError(f"raw_posterior shape {raw.shape} does not match expected {(ds.shape[0], ds.shape[1], 3)}")
+    train = (truth >= 0) if train_mask is None else (truth >= 0) & train_mask.astype(bool, copy=False)
+    if not np.any(train):
+        base = calibrate_genotype_posterior(raw, dosage=ds, depth=depth, temperature=0.35, blend=0.35)
+        return base, {"status": "no_training_rows"}
+
+    edges = _normalise_edges(maf_bins)
+    maf = estimate_maf_from_truth_or_posterior(truth_genotype=truth, posterior=raw, train_mask=train)
+    alt_af = estimate_alt_af_from_truth_or_posterior(truth_genotype=truth, posterior=raw, train_mask=train)
+    bin_idx = np.digitize(np.clip(maf, 0.0, 0.5), edges[1:-1], right=False).astype(np.int16, copy=False)
+    temps = [float(x) for x in temperatures if float(x) > 0.0]
+    blend_vals = [float(np.clip(x, 0.0, 1.0)) for x in blends]
+    scales = [float(x) for x in dosage_scales] if optimize_dosage_scale else [1.0]
+    offsets = [float(x) for x in dosage_offsets] if optimize_dosage_scale else [0.0]
+    prior_weights = [float(max(x, 0.0)) for x in hwe_prior_weights]
+    if not temps or not blend_vals or not scales or not offsets or not prior_weights:
+        raise ValueError("Calibration parameter grids must not be empty.")
+
+    out = np.empty_like(raw, dtype=np.float32)
+    bin_meta: list[dict[str, object]] = []
+    global_best: dict[str, float] | None = None
+    for b in range(edges.size - 1):
+        cols = bin_idx == b
+        if not np.any(cols):
+            continue
+        train_bin = train[:, cols]
+        n_train = int(np.sum(train_bin))
+        if n_train < int(min_train_rows_per_bin) and global_best is not None:
+            best = dict(global_best)
+            best["fallback"] = 1.0
+        else:
+            best_score = float("inf")
+            best = {
+                "temperature": 0.35,
+                "blend": 0.35,
+                "dosage_scale": 1.0,
+                "dosage_offset": 0.0,
+                "hwe_prior_weight": 0.0,
+                "score": float("inf"),
+                "fallback": 0.0,
+            }
+            raw_bin = raw[:, cols, :]
+            ds_bin0 = ds[:, cols]
+            truth_bin = truth[:, cols]
+            maf_bin = maf[cols]
+            alt_af_bin = alt_af[cols]
+            for scale in scales:
+                for offset in offsets:
+                    ds_bin = np.clip(ds_bin0 * float(scale) + float(offset), 0.0, 2.0).astype(np.float32, copy=False)
+                    for temp in temps:
+                        gp_dosage = dosage_to_genotype_posterior(
+                            ds_bin,
+                            depth=(None if depth is None else depth[:, cols]),
+                            temperature=float(temp),
+                            min_prob=float(min_prob),
+                            ploidy=2,
+                        )
+                        for blend in blend_vals:
+                            gp = (1.0 - float(blend)) * raw_bin + float(blend) * gp_dosage
+                            gp = np.clip(gp, float(min_prob), 1.0)
+                            gp /= np.clip(np.sum(gp, axis=2, keepdims=True), 1e-12, None)
+                            for prior_weight in prior_weights:
+                                gp_prior = apply_hwe_prior_to_posterior(
+                                    gp,
+                                    alt_af=alt_af_bin,
+                                    prior_weight=float(prior_weight),
+                                    min_prob=float(min_prob),
+                                )
+                                gp_train = gp_prior[train_bin]
+                                truth_train = truth_bin[train_bin]
+                                nll = _posterior_nll(gp_train[:, None, :], truth_train[:, None], min_prob=float(min_prob))
+                                brier = _posterior_brier(gp_train[:, None, :], truth_train[:, None])
+                                mse = _posterior_dosage_mse(gp_train[:, None, :], truth_train[:, None])
+                                hwe = _hwe_soft_penalty(
+                                    gp_prior,
+                                    maf=maf_bin,
+                                    hwe_weight=float(hwe_weight),
+                                    hwe_min_maf=float(hwe_min_maf),
+                                )
+                                score = nll + float(brier_weight) * brier + float(dosage_mse_weight) * mse + hwe
+                                if score < best_score:
+                                    best_score = float(score)
+                                    best = {
+                                        "temperature": float(temp),
+                                        "blend": float(blend),
+                                        "dosage_scale": float(scale),
+                                        "dosage_offset": float(offset),
+                                        "hwe_prior_weight": float(prior_weight),
+                                        "score": float(score),
+                                        "nll": float(nll),
+                                        "brier": float(brier),
+                                        "dosage_mse": float(mse),
+                                        "hwe_penalty": float(hwe),
+                                        "fallback": 0.0,
+                                    }
+            if n_train >= int(min_train_rows_per_bin):
+                global_best = dict(best)
+        scale = float(best["dosage_scale"])
+        offset = float(best["dosage_offset"])
+        ds_sel = np.clip(ds[:, cols] * scale + offset, 0.0, 2.0).astype(np.float32, copy=False)
+        gp_dosage = dosage_to_genotype_posterior(
+            ds_sel,
+            depth=(None if depth is None else depth[:, cols]),
+            temperature=float(best["temperature"]),
+            min_prob=float(min_prob),
+            ploidy=2,
+        )
+        blend = float(best["blend"])
+        out[:, cols, :] = (1.0 - blend) * raw[:, cols, :] + blend * gp_dosage
+        out[:, cols, :] = np.clip(out[:, cols, :], float(min_prob), 1.0)
+        out[:, cols, :] /= np.clip(np.sum(out[:, cols, :], axis=2, keepdims=True), 1e-12, None)
+        out[:, cols, :] = apply_hwe_prior_to_posterior(
+            out[:, cols, :],
+            alt_af=alt_af[cols],
+            prior_weight=float(best.get("hwe_prior_weight", 0.0)),
+            min_prob=float(min_prob),
+        )
+        meta_row = {
+            "bin": int(b),
+            "maf_min": float(edges[b]),
+            "maf_max": float(edges[b + 1]),
+            "n_variants": int(np.sum(cols)),
+            "n_train_rows": int(n_train),
+            **best,
+        }
+        bin_meta.append(meta_row)
+
+    # Any empty/unassigned variants keep the regular fixed calibration.
+    assigned = np.zeros(ds.shape[1], dtype=bool)
+    for row in bin_meta:
+        b = int(row["bin"])
+        assigned |= bin_idx == b
+    if np.any(~assigned):
+        out[:, ~assigned, :] = calibrate_genotype_posterior(
+            raw[:, ~assigned, :],
+            dosage=ds[:, ~assigned],
+            depth=(None if depth is None else depth[:, ~assigned]),
+            temperature=0.35,
+            blend=0.35,
+            min_prob=float(min_prob),
+            ploidy=2,
+        )
+    out = np.clip(out, float(min_prob), 1.0)
+    out /= np.clip(np.sum(out, axis=2, keepdims=True), 1e-12, None)
+    meta = {
+        "status": "ok",
+        "mode": "masked_cv",
+        "maf_bins": edges.tolist(),
+        "n_train_rows": int(np.sum(train)),
+        "hwe_weight": float(hwe_weight),
+        "hwe_min_maf": float(hwe_min_maf),
+        "hwe_prior_weights": [float(x) for x in prior_weights],
+        "optimize_dosage_scale": bool(optimize_dosage_scale),
+        "bins": bin_meta,
+    }
+    return out.astype(np.float32, copy=False), meta
 
 
 def read_log_likelihood_from_posterior(
@@ -325,6 +969,29 @@ def build_readaware_calibration_feature_matrix(
     info_col = np.broadcast_to(variant_info.astype(np.float32, copy=False)[None, :], ds.shape)
     _append("variant_info", info_col)
 
+    hwe_features = compute_hwe_features_from_posterior(gp)
+    for name, values in hwe_features.items():
+        fill = np.nan_to_num(values.astype(np.float32, copy=False), nan=0.0, posinf=300.0, neginf=0.0)
+        _append(f"variant_{name}", np.broadcast_to(fill[None, :], ds.shape))
+
+    site_ref_count = np.sum(ref_arr, axis=0).astype(np.float32, copy=False)
+    site_alt_count = np.sum(alt_arr, axis=0).astype(np.float32, copy=False)
+    site_other_count = np.sum(oth_arr, axis=0).astype(np.float32, copy=False)
+    site_total_count = np.sum(total, axis=0).astype(np.float32, copy=False)
+    site_support_samples = np.sum(total > 0.0, axis=0).astype(np.float32, copy=False)
+    site_support_rate = site_support_samples / float(max(n_samples, 1))
+    site_mean_depth = site_total_count / float(max(n_samples, 1))
+    for name, values in {
+        "site_ref_count": site_ref_count,
+        "site_alt_count": site_alt_count,
+        "site_other_count": site_other_count,
+        "site_total_count": site_total_count,
+        "site_support_samples": site_support_samples,
+        "site_support_rate": site_support_rate,
+        "site_mean_depth": site_mean_depth,
+    }.items():
+        _append(name, np.broadcast_to(values[None, :], ds.shape))
+
     if sample_metadata is not None and sample_metadata.size > 0:
         sm = sample_metadata.astype(np.float32, copy=False)
         for j in range(sm.shape[1]):
@@ -431,6 +1098,26 @@ def predict_lightgbm_binary_probability(model: Any, features: np.ndarray) -> np.
     if arr.ndim != 2 or arr.shape[1] != 2:
         raise ValueError(f"Expected binary LightGBM predict_proba shape (n,2), got {arr.shape}")
     return np.clip(arr[:, 1], 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def lightgbm_feature_importance(
+    model: Any,
+    feature_names: Sequence[str],
+    *,
+    top_n: int = 40,
+) -> list[dict[str, object]]:
+    importance = getattr(model, "feature_importances_", None)
+    if importance is None:
+        return []
+    vals = np.asarray(importance, dtype=np.float64).reshape(-1)
+    names = list(feature_names)
+    if vals.size != len(names):
+        names = [f"feature_{i}" for i in range(vals.size)]
+    order = np.argsort(vals)[::-1]
+    rows: list[dict[str, object]] = []
+    for idx in order[: max(int(top_n), 0)].tolist():
+        rows.append({"feature": str(names[idx]), "importance": float(vals[idx])})
+    return rows
 
 
 def train_stratified_lightgbm_multiclass_calibrator(
@@ -946,6 +1633,24 @@ def build_hardcall_quality_feature_matrix(
         variant_info = compute_info_score_per_variant(gp)
     maf_col = np.broadcast_to(variant_maf.astype(np.float32, copy=False)[None, :], (n_samples, n_positions))
     info_col = np.broadcast_to(variant_info.astype(np.float32, copy=False)[None, :], (n_samples, n_positions))
+    hwe_features = compute_hwe_features_from_posterior(gp)
+    hwe_cols = {
+        name: np.broadcast_to(
+            np.nan_to_num(values.astype(np.float32, copy=False), nan=0.0, posinf=300.0, neginf=0.0)[None, :],
+            (n_samples, n_positions),
+        )
+        for name, values in hwe_features.items()
+    }
+    site_total_count = np.sum(total, axis=0).astype(np.float32, copy=False)
+    site_support_samples = np.sum(total > 0.0, axis=0).astype(np.float32, copy=False)
+    site_support_rate = site_support_samples / float(max(n_samples, 1))
+    site_mean_depth = site_total_count / float(max(n_samples, 1))
+    site_cols = {
+        "site_total_count": np.broadcast_to(site_total_count[None, :], (n_samples, n_positions)),
+        "site_support_samples": np.broadcast_to(site_support_samples[None, :], (n_samples, n_positions)),
+        "site_support_rate": np.broadcast_to(site_support_rate[None, :], (n_samples, n_positions)),
+        "site_mean_depth": np.broadcast_to(site_mean_depth[None, :], (n_samples, n_positions)),
+    }
 
     cols = [
         ds.reshape(-1),
@@ -965,6 +1670,8 @@ def build_hardcall_quality_feature_matrix(
         post_var.reshape(-1),
         maf_col.reshape(-1),
         info_col.reshape(-1),
+        *(arr.reshape(-1) for arr in hwe_cols.values()),
+        *(arr.reshape(-1) for arr in site_cols.values()),
     ]
     names = [
         "dosage",
@@ -984,6 +1691,8 @@ def build_hardcall_quality_feature_matrix(
         "posterior_var",
         "variant_maf",
         "variant_info",
+        *(f"variant_{name}" for name in hwe_cols.keys()),
+        *site_cols.keys(),
     ]
     if generations is not None:
         gen = generations.astype(np.float32, copy=False)[:, None]
@@ -1013,6 +1722,7 @@ def calibrate_genotype_posterior_full_stack(
     use_optuna: bool = False,
     optuna_trials: int = 20,
     use_block_context: bool = True,
+    use_fixed_stage0_calibration: bool = False,
     seed: int = 0,
     class_weight_mode: str = "balanced",
     apply_isotonic: bool = True,
@@ -1030,14 +1740,22 @@ def calibrate_genotype_posterior_full_stack(
     else:
         predict_position_index = predict_position_index.astype(np.int64, copy=False)
 
-    gp_stage0 = calibrate_genotype_posterior(
-        raw_posterior,
-        dosage=ds,
-        depth=depth,
-        temperature=0.35,
-        blend=0.35,
-        min_prob=float(min_prob),
-    )
+    if raw_posterior is None:
+        gp_stage0 = dosage_to_genotype_posterior(ds, depth=depth, temperature=0.35, min_prob=float(min_prob), ploidy=2)
+        stage0_meta = {"status": "dosage_fallback", "temperature": 0.35}
+    elif use_fixed_stage0_calibration:
+        gp_stage0 = calibrate_genotype_posterior(
+            raw_posterior,
+            dosage=ds,
+            depth=depth,
+            temperature=0.35,
+            blend=0.35,
+            min_prob=float(min_prob),
+        )
+        stage0_meta = {"status": "fixed_temperature_blend", "temperature": 0.35, "blend": 0.35}
+    else:
+        gp_stage0 = raw_posterior.astype(np.float32, copy=False)
+        stage0_meta = {"status": "raw_hmm_gp", "temperature_blend_applied": False}
     if use_block_context:
         gp_stage1, block_meta = calibrate_genotype_posterior_block_context(
             raw_posterior=gp_stage0,
@@ -1066,7 +1784,7 @@ def calibrate_genotype_posterior_full_stack(
     variant_info = compute_info_score_per_variant(gp_stage1)
     variant_strata, strata_meta = compute_variant_strata(variant_maf, variant_info)
 
-    features, _ = build_readaware_calibration_feature_matrix(
+    features, feature_names = build_readaware_calibration_feature_matrix(
         dosage=ds,
         posterior=gp_stage1,
         depth=depth,
@@ -1102,6 +1820,7 @@ def calibrate_genotype_posterior_full_stack(
         max_rows=int(max_train_rows),
         class_weight_mode=class_weight_mode,
     )
+    posterior_feature_importance = lightgbm_feature_importance(global_model, feature_names)
 
     pred_flat = predict_stratified_lightgbm_posterior(
         features=features,
@@ -1124,7 +1843,7 @@ def calibrate_genotype_posterior_full_stack(
 
     gt_pred = np.argmax(gp_out, axis=2).astype(np.int8, copy=False)
     ds_pred = (gp_out[:, :, 1] + 2.0 * gp_out[:, :, 2]).astype(np.float32, copy=False)
-    call_features, _ = build_hardcall_quality_feature_matrix(
+    call_features, call_feature_names = build_hardcall_quality_feature_matrix(
         dosage=ds_pred,
         posterior=gp_out,
         depth=depth,
@@ -1154,6 +1873,7 @@ def calibrate_genotype_posterior_full_stack(
                 y_call,
                 seed=int(seed) + 17,
             )
+            call_feature_importance = lightgbm_feature_importance(call_model, call_feature_names)
             call_prob_flat = predict_lightgbm_binary_probability(call_model, call_features)
             call_prob = call_prob_flat.reshape(n_samples, n_positions).astype(np.float32, copy=False)
             thr, score, call_rate = optimize_call_correctness_threshold(
@@ -1167,13 +1887,17 @@ def calibrate_genotype_posterior_full_stack(
                 "score": float(score),
                 "call_rate": float(call_rate),
                 "n_rows": int(np.sum(valid_call_train)),
+                "feature_importance": call_feature_importance,
             }
 
     summary = {
         "status": "ok",
+        "stage0": stage0_meta,
         "block_context": block_meta,
         "strata": strata_meta,
         "stratified_fit": stratified_meta,
+        "posterior_feature_names": feature_names,
+        "posterior_feature_importance": posterior_feature_importance,
         "isotonic_enabled": bool(apply_isotonic),
         "isotonic_models": int(sum(1 for m in isotonic_models if m is not None)),
         "call_correctness": call_meta,

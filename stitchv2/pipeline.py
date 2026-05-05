@@ -18,6 +18,7 @@ from .calibration import (
     calibrate_genotype_posterior_full_stack,
     dosage_to_genotype_posterior,
     genotype_call_from_posterior,
+    masked_cv_calibrate_genotype_posterior,
 )
 from .config import PipelineConfig
 from .dask_executor import (
@@ -34,7 +35,7 @@ from .microarray import (
     load_microarray_hardcalls_from_plink,
     load_microarray_hardcalls_from_sample_plink_paths,
 )
-from .pedigree import smooth_dosage_with_pedigree
+from .pedigree import apply_pedigree_adjustment, coerce_pedigree_graph, has_pedigree_columns
 from .pileup import PysamReadExtractor, ReadEvidenceBlock
 
 
@@ -74,6 +75,17 @@ class StitchPipeline:
             subsample_seed=int(config.random_seed),
         )
 
+    def _calibration_train_position_index(self, n_positions: int, *, seed: int) -> np.ndarray:
+        idx = np.arange(max(int(n_positions), 0), dtype=np.int64)
+        if idx.size == 0:
+            return idx
+        frac = float(np.clip(self.config.calibration_train_site_fraction, 0.0, 1.0))
+        if frac >= 1.0:
+            return idx
+        n_take = max(1, int(np.ceil(frac * float(idx.size))))
+        rng = np.random.default_rng(int(seed))
+        return np.sort(rng.choice(idx, size=n_take, replace=False).astype(np.int64, copy=False))
+
     def prepare_inputs(
         self,
         samples: pd.DataFrame,
@@ -81,6 +93,26 @@ class StitchPipeline:
         founder_panel: FounderPanel | None = None,
     ) -> FounderPanel:
         samples = validate_samples(samples)
+        pedigree_source = pedigree
+        if pedigree_source is None and has_pedigree_columns(
+            samples,
+            offspring_col=self.config.pedigree_offspring_col,
+            parent1_col=self.config.pedigree_parent1_col,
+            parent2_col=self.config.pedigree_parent2_col,
+        ):
+            pedigree_source = samples
+        pedigree_graph = coerce_pedigree_graph(
+            pedigree_source,
+            samples["sample_id"].astype(str).to_numpy(dtype=object),
+            offspring_col=self.config.pedigree_offspring_col,
+            parent1_col=self.config.pedigree_parent1_col,
+            parent2_col=self.config.pedigree_parent2_col,
+        )
+        if pedigree_graph is not None:
+            (self.output_dir / "pedigree_summary.json").write_text(
+                json.dumps(pedigree_graph.summary(), indent=2),
+                encoding="utf-8",
+            )
         positions_df = load_positions(
             self.config.positions_path,
             self.config.chromosome,
@@ -146,7 +178,7 @@ class StitchPipeline:
                 immutable=self.config.founder.immutable,
             )
         founder_panel.to_parquet(self.output_dir / "founders.parquet", compression=self.config.compression)
-        self._run_blocks(samples, positions_df, founder_panel, pedigree)
+        self._run_blocks(samples, positions_df, founder_panel, pedigree_graph)
         return founder_panel
 
     def _resolve_sample_ploidy(self, samples: pd.DataFrame) -> np.ndarray:
@@ -519,7 +551,10 @@ class StitchPipeline:
                         self.io_config.write_genotype_posteriors
                         or self.io_config.write_genotype_calls
                     )
-                    need_genotype_posterior = requested_genotype_outputs
+                    need_genotype_posterior = requested_genotype_outputs or self.config.pedigree_mode in {
+                        "kinship",
+                        "transmission",
+                    }
                     positive_ploidies = np.unique(sample_ploidy[sample_ploidy > 0])
                     max_ploidy = int(np.max(sample_ploidy)) if sample_ploidy.size else int(self.config.ploidy)
                     if not backend_autotuned and np.any(sample_ploidy == 2):
@@ -707,11 +742,23 @@ class StitchPipeline:
                         )
                     t_after_hmm = time.perf_counter()
                     rss_after_hmm = _current_rss_mb() if self.config.profile_memory else None
-                    dosage = smooth_dosage_with_pedigree(
-                        artifacts.dosage,
-                        pedigree=pedigree,
-                        strength=self.config.pedigree_strength,
-                    )
+                    dosage = artifacts.dosage.astype(np.float32, copy=False)
+                    if self.config.pedigree_mode == "smooth":
+                        pedigree_result = apply_pedigree_adjustment(
+                            dosage=dosage,
+                            genotype_posterior=None,
+                            pedigree=pedigree,
+                            mode=self.config.pedigree_mode,
+                            strength=self.config.pedigree_strength,
+                            positions=block_founders.positions,
+                            generations=generations,
+                            support_mask=support_mask,
+                            iterations=self.config.pedigree_iterations,
+                            kinship_threshold=self.config.pedigree_kinship_threshold,
+                        )
+                        dosage = pedigree_result.dosage
+                    else:
+                        pedigree_result = None
                     calibrated_gp = None
                     calibrated_gt = None
                     call_correct_probability = None
@@ -737,8 +784,42 @@ class StitchPipeline:
                                 blend=self.config.genotype_posterior_blend,
                                 ploidy=max_ploidy,
                             )
+                        truth_gt_block = None
+                        if self._microarray_dosage is not None and calibrated_gp.shape[2] == 3:
+                            start = block.block_id * self.config.block_size
+                            stop = min((block.block_id + 1) * self.config.block_size, self._microarray_dosage.shape[1])
+                            micro_block = self._microarray_dosage[:, start:stop]
+                            truth_gt_block = np.full(micro_block.shape, -1, dtype=np.int8)
+                            valid_micro = np.isfinite(micro_block)
+                            if np.any(valid_micro):
+                                truth_gt_block[valid_micro] = np.clip(
+                                    np.rint(micro_block[valid_micro]),
+                                    0,
+                                    2,
+                                ).astype(np.int8, copy=False)
+                        if (
+                            self.config.calibration_mode == "masked_cv"
+                            and truth_gt_block is not None
+                            and int(np.sum(truth_gt_block >= 0)) >= 16
+                        ):
+                            calibrated_gp, calibration_meta = masked_cv_calibrate_genotype_posterior(
+                                raw_posterior=artifacts.genotype_posterior,
+                                dosage=dosage,
+                                truth_genotype=truth_gt_block,
+                                train_mask=truth_gt_block >= 0,
+                                depth=evidence.depth.astype(np.float32, copy=False),
+                                maf_bins=self.config.calibration_maf_bins,
+                                temperatures=self.config.calibration_temperatures,
+                                blends=self.config.calibration_blends,
+                                dosage_scales=self.config.calibration_dosage_scales,
+                                dosage_offsets=self.config.calibration_dosage_offsets,
+                                hwe_prior_weights=self.config.calibration_hwe_prior_weights,
+                                optimize_dosage_scale=bool(self.config.calibration_optimize_dosage_scale),
+                                hwe_weight=float(self.config.calibration_hwe_weight),
+                                hwe_min_maf=float(self.config.calibration_hwe_min_maf),
+                                ploidy=max_ploidy,
+                            )
                         if self.config.use_lightgbm_calibrator and calibrated_gp is not None and calibrated_gp.shape[2] == 3:
-                            truth_gt_block = None
                             if self._microarray_dosage is not None:
                                 start = block.block_id * self.config.block_size
                                 stop = min((block.block_id + 1) * self.config.block_size, self._microarray_dosage.shape[1])
@@ -752,8 +833,17 @@ class StitchPipeline:
                                         2,
                                     ).astype(np.int8, copy=False)
                             if truth_gt_block is not None and int(np.sum(truth_gt_block >= 0)) >= 128:
+                                train_positions = self._calibration_train_position_index(
+                                    calibrated_gp.shape[1],
+                                    seed=int(self.config.random_seed + block.block_id),
+                                )
+                                lgbm_input_gp = (
+                                    artifacts.genotype_posterior
+                                    if artifacts.genotype_posterior is not None
+                                    else calibrated_gp
+                                )
                                 calibrated_gp, call_correct_probability, calibration_meta = calibrate_genotype_posterior_full_stack(
-                                    raw_posterior=calibrated_gp,
+                                    raw_posterior=lgbm_input_gp,
                                     dosage=dosage,
                                     truth_genotype=truth_gt_block,
                                     depth=evidence.depth.astype(np.float32, copy=False),
@@ -763,24 +853,30 @@ class StitchPipeline:
                                     support_mask=support_mask.astype(np.float32, copy=False),
                                     generations=generations.astype(np.float32, copy=False),
                                     samples_df=samples,
-                                    train_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
+                                    train_position_index=train_positions,
                                     predict_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
                                     window=int(self.config.calibration_context_window),
                                     block_size=int(self.config.calibration_block_snps),
                                     max_train_rows=int(self.config.calibration_max_train_rows),
                                     use_optuna=bool(self.config.calibration_use_optuna),
                                     optuna_trials=int(self.config.calibration_optuna_trials),
+                                    use_block_context=bool(self.config.calibration_lightgbm_use_block_context),
+                                    use_fixed_stage0_calibration=bool(self.config.calibration_lightgbm_use_fixed_stage0),
                                     seed=int(self.config.random_seed + block.block_id),
                                     class_weight_mode="balanced",
                                     apply_isotonic=True,
                                 )
                             elif truth_gt_block is not None:
+                                train_positions = self._calibration_train_position_index(
+                                    calibrated_gp.shape[1],
+                                    seed=int(self.config.random_seed + block.block_id),
+                                )
                                 calibrated_gp, calibration_meta = calibrate_genotype_posterior_block_context(
-                                    raw_posterior=calibrated_gp,
+                                    raw_posterior=artifacts.genotype_posterior,
                                     dosage=dosage,
                                     truth_genotype=truth_gt_block,
                                     samples_df=samples,
-                                    train_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
+                                    train_position_index=train_positions,
                                     predict_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
                                     window=int(self.config.calibration_context_window),
                                     block_size=int(self.config.calibration_block_snps),
@@ -789,6 +885,21 @@ class StitchPipeline:
                                     optuna_trials=int(self.config.calibration_optuna_trials),
                                     seed=int(self.config.random_seed + block.block_id),
                                 )
+                        if self.config.pedigree_mode in {"kinship", "transmission"}:
+                            pedigree_result = apply_pedigree_adjustment(
+                                dosage=dosage,
+                                genotype_posterior=calibrated_gp,
+                                pedigree=pedigree,
+                                mode=self.config.pedigree_mode,
+                                strength=self.config.pedigree_strength,
+                                positions=block_founders.positions,
+                                generations=generations,
+                                support_mask=support_mask,
+                                iterations=self.config.pedigree_iterations,
+                                kinship_threshold=self.config.pedigree_kinship_threshold,
+                            )
+                            dosage = pedigree_result.dosage
+                            calibrated_gp = pedigree_result.genotype_posterior
                         calibrated_gp = self._mask_genotype_posterior_by_ploidy(calibrated_gp, sample_ploidy)
                         stitch_threshold = None
                         min_confidence = 0.0
@@ -860,11 +971,25 @@ class StitchPipeline:
                         block_timing["call_rate"] = float(np.mean(calibrated_gt >= 0))
                         block_timing["no_call_rate"] = float(np.mean(calibrated_gt < 0))
                     if isinstance(calibration_meta, dict):
+                        status = calibration_meta.get("status")
+                        mode = calibration_meta.get("mode")
+                        if status is not None:
+                            block_timing["calibration_status"] = str(status)
+                        if mode is not None:
+                            block_timing["calibration_mode"] = str(mode)
                         cc = calibration_meta.get("call_correctness")
                         if isinstance(cc, dict):
                             thr = cc.get("threshold")
                             if thr is not None:
                                 block_timing["call_correctness_threshold"] = float(thr)
+                    if pedigree_result is not None:
+                        block_timing["pedigree_mode"] = str(pedigree_result.mode)
+                        summary = pedigree_result.summary
+                        if summary:
+                            block_timing["pedigree_edges"] = int(summary.get("n_edges", 0))
+                            block_timing["pedigree_components"] = int(summary.get("n_components", 0))
+                            if "messages" in summary:
+                                block_timing["pedigree_messages"] = int(summary.get("messages", 0))
                     if self.config.profile_memory:
                         block_timing.update(
                             {
@@ -1036,11 +1161,23 @@ class StitchPipeline:
         dask_extra: dict[str, float | int | str | bool] | None = None,
     ) -> dict[str, float | int | str | bool]:
         rss_after_hmm = _current_rss_mb() if self.config.profile_memory else None
-        dosage = smooth_dosage_with_pedigree(
-            artifacts.dosage,
-            pedigree=pedigree,
-            strength=self.config.pedigree_strength,
-        )
+        dosage = artifacts.dosage.astype(np.float32, copy=False)
+        if self.config.pedigree_mode == "smooth":
+            pedigree_result = apply_pedigree_adjustment(
+                dosage=dosage,
+                genotype_posterior=None,
+                pedigree=pedigree,
+                mode=self.config.pedigree_mode,
+                strength=self.config.pedigree_strength,
+                positions=block.dataframe["POS"].to_numpy(dtype=np.int64, copy=False),
+                generations=generations,
+                support_mask=support_mask,
+                iterations=self.config.pedigree_iterations,
+                kinship_threshold=self.config.pedigree_kinship_threshold,
+            )
+            dosage = pedigree_result.dosage
+        else:
+            pedigree_result = None
         calibrated_gp = None
         calibrated_gt = None
         call_correct_probability = None
@@ -1066,8 +1203,42 @@ class StitchPipeline:
                     blend=self.config.genotype_posterior_blend,
                     ploidy=max_ploidy,
                 )
+            truth_gt_block = None
+            if self._microarray_dosage is not None and calibrated_gp.shape[2] == 3:
+                start = int(block_start_offset)
+                stop = min(start + int(evidence.ref_count.shape[1]), self._microarray_dosage.shape[1])
+                micro_block = self._microarray_dosage[:, start:stop]
+                truth_gt_block = np.full(micro_block.shape, -1, dtype=np.int8)
+                valid_micro = np.isfinite(micro_block)
+                if np.any(valid_micro):
+                    truth_gt_block[valid_micro] = np.clip(
+                        np.rint(micro_block[valid_micro]),
+                        0,
+                        2,
+                    ).astype(np.int8, copy=False)
+            if (
+                self.config.calibration_mode == "masked_cv"
+                and truth_gt_block is not None
+                and int(np.sum(truth_gt_block >= 0)) >= 16
+            ):
+                calibrated_gp, calibration_meta = masked_cv_calibrate_genotype_posterior(
+                    raw_posterior=artifacts.genotype_posterior,
+                    dosage=dosage,
+                    truth_genotype=truth_gt_block,
+                    train_mask=truth_gt_block >= 0,
+                    depth=evidence.depth.astype(np.float32, copy=False),
+                    maf_bins=self.config.calibration_maf_bins,
+                    temperatures=self.config.calibration_temperatures,
+                    blends=self.config.calibration_blends,
+                    dosage_scales=self.config.calibration_dosage_scales,
+                    dosage_offsets=self.config.calibration_dosage_offsets,
+                    hwe_prior_weights=self.config.calibration_hwe_prior_weights,
+                    optimize_dosage_scale=bool(self.config.calibration_optimize_dosage_scale),
+                    hwe_weight=float(self.config.calibration_hwe_weight),
+                    hwe_min_maf=float(self.config.calibration_hwe_min_maf),
+                    ploidy=max_ploidy,
+                )
             if self.config.use_lightgbm_calibrator and calibrated_gp is not None and calibrated_gp.shape[2] == 3:
-                truth_gt_block = None
                 if self._microarray_dosage is not None:
                     start = int(block_start_offset)
                     stop = min(start + int(evidence.ref_count.shape[1]), self._microarray_dosage.shape[1])
@@ -1081,8 +1252,17 @@ class StitchPipeline:
                             2,
                         ).astype(np.int8, copy=False)
                 if truth_gt_block is not None and int(np.sum(truth_gt_block >= 0)) >= 128:
+                    train_positions = self._calibration_train_position_index(
+                        calibrated_gp.shape[1],
+                        seed=int(self.config.random_seed + block.block_id),
+                    )
+                    lgbm_input_gp = (
+                        artifacts.genotype_posterior
+                        if artifacts.genotype_posterior is not None
+                        else calibrated_gp
+                    )
                     calibrated_gp, call_correct_probability, calibration_meta = calibrate_genotype_posterior_full_stack(
-                        raw_posterior=calibrated_gp,
+                        raw_posterior=lgbm_input_gp,
                         dosage=dosage,
                         truth_genotype=truth_gt_block,
                         depth=evidence.depth.astype(np.float32, copy=False),
@@ -1092,24 +1272,30 @@ class StitchPipeline:
                         support_mask=support_mask.astype(np.float32, copy=False),
                         generations=generations.astype(np.float32, copy=False),
                         samples_df=samples,
-                        train_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
+                        train_position_index=train_positions,
                         predict_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
                         window=int(self.config.calibration_context_window),
                         block_size=int(self.config.calibration_block_snps),
                         max_train_rows=int(self.config.calibration_max_train_rows),
                         use_optuna=bool(self.config.calibration_use_optuna),
                         optuna_trials=int(self.config.calibration_optuna_trials),
+                        use_block_context=bool(self.config.calibration_lightgbm_use_block_context),
+                        use_fixed_stage0_calibration=bool(self.config.calibration_lightgbm_use_fixed_stage0),
                         seed=int(self.config.random_seed + block.block_id),
                         class_weight_mode="balanced",
                         apply_isotonic=True,
                     )
                 elif truth_gt_block is not None:
+                    train_positions = self._calibration_train_position_index(
+                        calibrated_gp.shape[1],
+                        seed=int(self.config.random_seed + block.block_id),
+                    )
                     calibrated_gp, calibration_meta = calibrate_genotype_posterior_block_context(
-                        raw_posterior=calibrated_gp,
+                        raw_posterior=artifacts.genotype_posterior,
                         dosage=dosage,
                         truth_genotype=truth_gt_block,
                         samples_df=samples,
-                        train_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
+                        train_position_index=train_positions,
                         predict_position_index=np.arange(calibrated_gp.shape[1], dtype=np.int64),
                         window=int(self.config.calibration_context_window),
                         block_size=int(self.config.calibration_block_snps),
@@ -1118,6 +1304,21 @@ class StitchPipeline:
                         optuna_trials=int(self.config.calibration_optuna_trials),
                         seed=int(self.config.random_seed + block.block_id),
                     )
+            if self.config.pedigree_mode in {"kinship", "transmission"}:
+                pedigree_result = apply_pedigree_adjustment(
+                    dosage=dosage,
+                    genotype_posterior=calibrated_gp,
+                    pedigree=pedigree,
+                    mode=self.config.pedigree_mode,
+                    strength=self.config.pedigree_strength,
+                    positions=block.dataframe["POS"].to_numpy(dtype=np.int64, copy=False),
+                    generations=generations,
+                    support_mask=support_mask,
+                    iterations=self.config.pedigree_iterations,
+                    kinship_threshold=self.config.pedigree_kinship_threshold,
+                )
+                dosage = pedigree_result.dosage
+                calibrated_gp = pedigree_result.genotype_posterior
             calibrated_gp = self._mask_genotype_posterior_by_ploidy(calibrated_gp, sample_ploidy)
             stitch_threshold = None
             min_confidence = 0.0
@@ -1189,6 +1390,12 @@ class StitchPipeline:
             block_timing["call_rate"] = float(np.mean(calibrated_gt >= 0))
             block_timing["no_call_rate"] = float(np.mean(calibrated_gt < 0))
         if isinstance(calibration_meta, dict):
+            status = calibration_meta.get("status")
+            mode = calibration_meta.get("mode")
+            if status is not None:
+                block_timing["calibration_status"] = str(status)
+            if mode is not None:
+                block_timing["calibration_mode"] = str(mode)
             cc = calibration_meta.get("call_correctness")
             if isinstance(cc, dict):
                 thr = cc.get("threshold")
@@ -1196,6 +1403,14 @@ class StitchPipeline:
                     block_timing["call_correctness_threshold"] = float(thr)
         if dask_extra:
             block_timing.update(dask_extra)
+        if pedigree_result is not None:
+            block_timing["pedigree_mode"] = str(pedigree_result.mode)
+            summary = pedigree_result.summary
+            if summary:
+                block_timing["pedigree_edges"] = int(summary.get("n_edges", 0))
+                block_timing["pedigree_components"] = int(summary.get("n_components", 0))
+                if "messages" in summary:
+                    block_timing["pedigree_messages"] = int(summary.get("messages", 0))
         if self.config.profile_memory:
             block_timing.update(
                 {
@@ -1236,7 +1451,10 @@ class StitchPipeline:
         )
         max_ploidy_global = int(np.max(sample_ploidy)) if sample_ploidy.size else int(self.config.ploidy)
         requested_genotype_outputs = self.io_config.write_genotype_posteriors or self.io_config.write_genotype_calls
-        need_genotype_posterior = requested_genotype_outputs
+        need_genotype_posterior = requested_genotype_outputs or self.config.pedigree_mode in {
+            "kinship",
+            "transmission",
+        }
         return_full_transition = self.io_config.transition_output == "full"
         return_haplotype = self.io_config.write_haplotype_probabilities
         configured_sample_batch = int(self.config.dask_sample_batch_size) or int(self.config.jax_sample_batch_size)
@@ -1270,7 +1488,7 @@ class StitchPipeline:
             "memory_limit": memory_limit,
             "dashboard_address": dashboard_address,
         }
-        if isinstance(dashboard_address, str) and dashboard_address.startswith("127.0.0.1:"):
+        if bool(self.config.dask_processes) and isinstance(dashboard_address, str) and dashboard_address.startswith("127.0.0.1:"):
             cluster_kwargs["host"] = "127.0.0.1"
         if not bool(self.config.dask_processes):
             cluster_kwargs["protocol"] = "inproc://"
