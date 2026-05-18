@@ -1,0 +1,254 @@
+Metadata-Version: 2.4
+Name: stitchv2
+Version: 0.1.0
+Summary: Streaming STITCH-style low-coverage imputation in Python/JAX.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.25
+Requires-Dist: pandas>=2.0
+Requires-Dist: pyarrow>=14.0
+Requires-Dist: pysam>=0.22
+Requires-Dist: jax>=0.4.28
+Requires-Dist: jaxlib>=0.4.28
+Requires-Dist: scipy>=1.11
+Requires-Dist: scikit-learn>=1.5
+Requires-Dist: lightgbm>=4.0
+Requires-Dist: xarray>=2024.3.0
+Requires-Dist: zarr>=2.18
+Requires-Dist: dask[array]>=2024.3.0
+Requires-Dist: distributed>=2024.3.0
+Provides-Extra: plink
+Requires-Dist: npplink>=0.3; extra == "plink"
+Provides-Extra: ml
+Requires-Dist: optuna>=3.6; extra == "ml"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+
+# STITCHV2
+
+`stitchv2` is a Python/JAX implementation scaffold for a STITCH-style low-coverage imputation workflow with:
+
+- streaming read-level `pysam` extraction over an explicit `(CHR, POS)` table
+- founder panels from VCF, BAM-derived evidence, or PLINK via `npplink`
+- block-wise Arrow/Parquet persistence
+- JAX forward-backward kernels suitable for CPU/GPU execution
+- optional pedigree-aware post-HMM imputation (`smooth`, `kinship`, or recombination-smoothed `transmission` message passing)
+- fragment-coupled read likelihood support (multi-SNP read evidence, center-anchored)
+- optional STITCH-parity centered fragment/read coupling (`fragment_coupling_model="stitch_parity"`)
+- calibrated genotype posterior/call outputs (GP/GT parquet, optional xarray/Zarr float store, explicit BCF interoperability export)
+- configurable ploidy (`--ploidy`, `--ploidy-males`, `--ploidy-females`) including sex-chromosome use cases
+- optional chromosome-window runs (`--chr-start`, `--chr-end`)
+- supporting-read mask output (`support_mask` parquet) aligned to sample x variant genotype outputs
+- optional microarray hard-genotype integration from PLINK (`microarray_plink_path`)
+- optional per-sample microarray PLINK sources via `samples.parquet: plink_path` (multiple samples can share files)
+- 5-fold CV/tuning harness for K/nGen/S + seed averaging with optional LightGBM post-calibration
+
+This package is designed for large cohorts where BAMs and posterior tensors must be processed in blocks and written to disk eagerly.
+
+The implementation follows the published STITCH paper closely at the modeling level, but it is not a line-for-line port of the upstream R/C++ code. In a few places the paper is high level, so this package uses explicit documented approximations:
+
+- recombination transitions use a Li-Stephens-style switch process parameterized by genetic distance and sample generation
+- mutable founders are represented as per-founder alt-allele probabilities instead of hard haplotypes
+- pedigree information can enter as post-HMM smoothing, kinship fallback, or parent-offspring transmission message passing
+
+Detailed pedigree usage, embedded `father`/`mother` sample columns, equations, and validation benchmarks are documented in `docs/pedigree_tutorial.md`.
+Detailed masked-CV calibration equations, no-call threshold behavior, benchmark interpretation, and future calibration scaling ideas are documented in `docs/CALIBRATION_MASKED_CV_REPORT.md`.
+
+## Performance notes
+
+The default pipeline settings are tuned for lower RAM and lower serialization cost:
+
+- `read_mode="read_stream"` avoids pileup-column iteration overhead and processes aligned reads directly.
+- `read_stream_backend="htslib"` (or `"auto"` when compiled extension is present) uses native HTSlib C++ traversal for the read-aware path.
+- read extraction can be parallelized across samples (`io_workers > 1`) and each BAM can use HTSlib decompression threads (`htslib_threads_per_file > 1`).
+- transition outputs are written in a compact form (`switch_probability`, `stay_probability`, `offdiag_probability`) by default rather than full state x state matrices.
+- parquet writes use dictionary encoding plus `zstd` with configurable compression level.
+- CPU runs default to a memory-efficient numpy forward-backward; GPU-capable hosts can run JAX (`hmm_backend="jax"` or `"auto"`).
+- JAX diploid kernels support ahead-of-time lowering/compile-by-shape (`jax_aot_compile=True`) to reduce runtime JIT overhead.
+- fragment likelihoods can be combined with per-site evidence (`fragment_likelihood_mode="augment"`) or replace centered per-site terms (`"replace"`).
+- for stronger parity with original STITCH read-aware behavior, use `fragment_coupling_model="stitch_parity"` with rescaling controls (`fragment_max_diff_reads`, `fragment_max_emission_diff`).
+- read matrices can be allocated as memory maps (`memory_map_read_matrices=True`) for lower peak RAM on large sample x SNP blocks.
+- current implementation uses batched `pysam` streaming for read extraction.
+
+To profile hotspots on a real dataset:
+
+```bash
+python benchmarks/profile_bottlenecks.py \
+  --data-dir benchmark_runs/synth_5mb_2k_0p1x \
+  --output-dir benchmark_runs/profile_new \
+  --k 8 --iterations 2 --block-size 1000
+```
+
+To build the optional native HTSlib read-stream backend in-place:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+Then use `read_stream_backend="htslib"` (or `"auto"`) in `PipelineConfig`.
+
+To auto-tune backend and block size on a representative dataset:
+
+```bash
+python benchmarks/tune_backends.py \
+  --data-dir benchmark_runs/synth_5mb_2k_0p1x \
+  --output-dir benchmark_runs/tune_runs \
+  --chromosome chrSynthetic \
+  --k 8 --iterations 2 \
+  --block-sizes 500,1000,2000 \
+  --backends auto,numpy,jax \
+  --fragment-modes replace,augment
+```
+
+To run repeated memory-growth checks:
+
+```bash
+python benchmarks/check_memory_leak.py \
+  --data-dir benchmark_runs/synth_5mb_2k_0p1x \
+  --output-dir benchmark_runs/memory_check \
+  --chromosome chrSynthetic \
+  --k 8 --iterations 2 --block-size 1000 \
+  --backend auto --repeats 4
+```
+
+## Minimal usage
+
+```python
+import pandas as pd
+
+from stitchv2 import PipelineConfig, StitchPipeline
+
+samples = pd.DataFrame(
+    {
+        "sample_id": ["a", "b"],
+        "bam_path": ["a.bam", "b.bam"],
+        "generation": [10.0, 12.0],
+    }
+)
+
+config = PipelineConfig(
+    chromosome="chr1",
+    positions_path="positions.parquet",
+    output_dir="out",
+    n_founders=8,
+    block_size=5000,
+    jax_sample_batch_size=64,  # lower peak JAX memory (0 = all samples)
+    read_stream_backend="auto",
+    io_workers=4,
+    htslib_threads_per_file=2,
+)
+
+pipeline = StitchPipeline(config)
+pipeline.prepare_inputs(samples)
+```
+
+## CLI
+
+Run the pipeline:
+
+```bash
+stitchv2 run \
+  --samples samples.parquet \
+  --positions positions.parquet \
+  --chromosome chr1 \
+  --output-dir out \
+  --n-founders 8 \
+  --hmm-backend jax \
+  --jax-sample-batch-size 64 \
+  --read-stream-backend auto \
+  --io-workers 8 \
+  --htslib-threads-per-file 2 \
+  --fragment-coupling-model stitch_parity \
+  --write-genotype-posteriors \
+  --write-genotype-calls \
+  --write-support-mask \
+  --microarray-plink /path/to/microarray_prefix \
+  --memory-map-read-matrices
+```
+
+JAX-only benchmark scripts:
+
+```bash
+python benchmarks/benchmark_calibration_strategies.py \
+  --data-dir benchmark_runs/synth_5mb_2k_0p1x \
+  --run-dir benchmark_runs/readaware_matrix_v2_synth_jax_hap0 \
+  --output-dir benchmark_runs/calibration_synth_jax \
+  --use-optuna --optuna-trials 20
+
+python benchmarks/benchmark_real_subsample_jax.py \
+  --data-dir benchmark_runs/stitch_example \
+  --output-dir benchmark_runs/real_subsample_jax \
+  --chromosome 19 --k 8 --iterations 2
+
+python benchmarks/generate_calibration_benchmark_report.py \
+  --benchmark-dir benchmark_runs/calibration_synth_jax
+
+python benchmarks/generate_real_subsample_benchmark_report.py \
+  --benchmark-dir benchmark_runs/real_subsample_jax
+
+python benchmarks/generate_readaware_v3_detailed_report.py
+```
+
+Profile/tune JAX memory and runtime:
+
+```bash
+stitchv2 tune-jax-memory \
+  --data-dir benchmark_runs/synth_5mb_2k_0p1x \
+  --output-dir benchmark_runs/tune_jax \
+  --chromosome chrSynthetic \
+  --n-founders 8 \
+  --block-sizes 500,1000,2000 \
+  --memory-map-modes off,on \
+  --jax-sample-batch-sizes 0,64,128
+```
+
+Combine parquet outputs, optionally writing floating outputs to xarray/Zarr:
+
+```bash
+stitchv2 combine --run-output-dir out
+stitchv2 combine --run-output-dir out --write-zarr --zarr-output out/combined/float_outputs.zarr
+stitchv2 export-bcf --run-output-dir out --output-bcf out/stitch.chr1.bcf --chromosome chr1
+```
+
+BCF is only an explicit interoperability path and WILL slow down I/O. Keep primary results in Parquet/Zarr. STITCHV2 does not allow VCF export.
+
+Run cross-validation/tuning (5-fold, 20% holdout, seed averaging):
+
+```bash
+stitchv2 cv \
+  --samples samples.parquet \
+  --positions positions.parquet \
+  --pseudo-truth pseudo_truth.parquet \
+  --chromosome chr1 \
+  --output-dir out_cv \
+  --k-values 6,8,10 \
+  --ngen-values 0.75,1.0,1.25 \
+  --s-values 2,3 \
+  --seeds 0,1,2 \
+  --folds 5 \
+  --holdout-fraction 0.2 \
+  --hmm-backend jax \
+  --fragment-coupling-model stitch_parity \
+  --lightgbm-post-calibrator
+```
+
+`combine_pipeline_outputs(...)` returns a lazy `xarray.Dataset` (dask-backed) and stores combination metadata in `dataset.attrs["combine_summary"]`.
+
+## Tutorial Notebook
+
+See [docs/stitchv2_tutorial.ipynb](docs/stitchv2_tutorial.ipynb), or the markdown companion [docs/stitchv2_tutorial.md](docs/stitchv2_tutorial.md), for an end-to-end walkthrough of:
+
+- input file formats
+- every `stitchv2 run` parameter with the closest original STITCH equivalent
+- BAM/CRAM, PLINK, parquet, founder, microarray, and pedigree workflows
+- mixed haploid/diploid and sex-chromosome ploidy handling
+- resource scaling with samples, SNPs, founders, ploidy, JAX, and Dask
+- block/chunk outputs and their schemas
+- combining parquet chunks
+- explicit BCF interoperability export and native Parquet/Zarr outputs for downstream conversion
+
+For a parameter-by-parameter synthetic walkthrough (including mutable vs STITCH-parity founder settings), see:
+- [docs/stitchv2_tutorial_synthetic.md](docs/stitchv2_tutorial_synthetic.md)
+
+For the detailed JupyterLab tutorial series with executed notebooks, model equations, STITCH parameter crosswalks, interactive Python examples, pedigree/ploidy examples, calibration plots, and Dask/10k-sample scaling diagnostics, see:
+- [docs/tutorial_deep/README.md](docs/tutorial_deep/README.md)

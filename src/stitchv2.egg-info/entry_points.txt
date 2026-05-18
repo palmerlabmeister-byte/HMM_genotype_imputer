@@ -1,0 +1,2 @@
+[console_scripts]
+stitchv2 = stitchv2.cli:main
