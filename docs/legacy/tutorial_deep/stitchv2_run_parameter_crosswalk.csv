@@ -1,0 +1,55 @@
+STITCHV2 parameter,Example,Closest STITCH equivalent,Detailed meaning
+--samples,samples.parquet,bamlist + sampleNames_file,Sample metadata. `generation` is required. `sample_id` and `bam_path` are normalized if absent. Optional `sex` and `plink_path` enable mixed ploidy and per-sample microarray evidence.
+--positions,positions.parquet,posfile,Variant table. Requires `CHR` and `POS`; `REF` and `ALT` default to `N` if missing but should be present for real runs.
+--chromosome,chr1,chr,"Contig to process. Must match positions, BAM headers, founder VCF/PLINK, and export contig labels."
+--chr-start,100000,regionStart,Inclusive coordinate start. STITCH has buffer behavior; STITCHV2 currently filters directly to the requested range.
+--chr-end,200000,regionEnd,Inclusive coordinate end for chunk-of-chromosome runs.
+--output-dir,runs/chr1,outputdir,Run directory. STITCHV2 writes chunked parquet plus summaries; STITCH writes VCF and temporary R/C++ artifacts.
+--n-founders,8,K,Number of founder/mosaic haplotypes. More K can improve representation but increases state count and runtime.
+--ploidy,2,method=diploid or pseudoHaploid,Default ploidy for all samples. `0` writes missing outputs without HMM computation for those samples.
+--ploidy-males,1,no direct equivalent,Male ploidy override based on `samples.sex`; use with `--ploidy-females`. Useful for chrX/chrY.
+--ploidy-females,2,no direct equivalent,Female ploidy override based on `samples.sex`; use with `--ploidy-males`.
+--block-size,1000,inputBundleBlockSize / region chunking,Number of variants per block. Larger blocks reduce overhead but increase memory.
+--em-iterations,5,iterations,Number of EM passes. Low values are fast but can underfit; parity benchmarks typically use 5-10.
+--hmm-backend,jax,STITCH C++ engine,"Backend: `auto`, `numpy`, `jax`, or `torch`. JAX is preferred for large runs."
+--jax-sample-batch-size,256,no direct equivalent,Controls samples per JAX call. Lower values reduce memory; higher values reduce overhead.
+--executor,serial|dask,nCores partly,Serial runs blocks directly; Dask schedules coarse HMM leaf tasks over blocks/sample batches/ploidy groups.
+--dask-dashboard-address,127.0.0.1:8786,no direct equivalent,Live Dask dashboard bind address.
+--dask-performance-report,report.html,no direct equivalent,"Static HTML performance report with task stream, worker, and memory diagnostics."
+--dask-task-stream,task_stream.json,no direct equivalent,Task stream artifact for later inspection.
+--dask-n-workers,4,nCores partly,"Number of local workers. For GPU use, usually one worker per GPU."
+--dask-threads-per-worker,1,nCores partly,Threads per Dask worker. Often keep at 1 for JAX leaf tasks.
+--dask-memory-limit,16GB,no direct equivalent,Per-worker memory guardrail.
+--dask-target-task-memory-mb,4096,no direct equivalent,Planner target used to shrink block/sample batches.
+--read-mode,read_stream,read-aware BAM processing,`read_stream` is the read-aware path; `pileup` is a fallback/diagnostic path.
+--read-stream-backend,auto,STITCH BAM parser,Chooses Python/pysam or compiled htslib backend when available.
+--io-workers,4,nCores partly,Parallel read extraction workers.
+--htslib-threads-per-file,2,no direct equivalent,Threads per BAM/CRAM file for htslib backend.
+--fragment-likelihood-mode,augment,read-aware emission model,`augment` combines count and fragment evidence; `replace` uses fragment likelihood more directly.
+--fragment-coupling-model,stitch_parity,STITCH read-aware fragment behavior,Current benchmark mode; legacy center mode is intentionally not retained for parity comparisons.
+--fragment-max-diff-reads,100,implementation guardrail,Caps extreme read-likelihood differences for numerical stability.
+--fragment-max-emission-diff,1000,implementation guardrail,Caps extreme emission-matrix differences for numerical stability.
+--no-fragment-rescale-read-likelihood,flag,no direct equivalent,Disables read-likelihood rescaling. Usually leave rescaling on.
+--write-transitions,flag,debug/internal outputs,Write transition/recombination diagnostics.
+--write-haplotype-probabilities,flag,output_haplotype_dosages,Write founder/haplotype posterior-like outputs. Useful but larger.
+--write-genotype-posteriors,flag,GP in VCF,Write GP arrays to parquet. Needed for calibration inspection and high-quality export.
+--write-genotype-calls,flag,GT in VCF,Write hard genotype calls.
+--write-support-mask,flag,no direct equivalent,Write whether each sample/variant had direct read/array support.
+--no-calibrate-genotype-posteriors,flag,STITCH does not expose same calibration,Turns off STITCHV2 default posterior calibration.
+--genotype-posterior-temperature,0.35,no direct equivalent,Sharpness of dosage-derived posterior used in calibration.
+--genotype-posterior-blend,0.35,no direct equivalent,Mixture weight between raw posterior and dosage-derived calibrated posterior.
+--genotype-call-mode,argmax,STITCH GP threshold behavior,"`argmax`, `stitch_no_call`, or `quality_gated`."
+--genotype-call-stitch-threshold,0.9,STITCH no-call threshold,GP confidence threshold when `genotype-call-mode=stitch_no_call`.
+--use-lightgbm-calibrator,flag,no direct equivalent,Optional learned correctness/posterior calibration layer.
+--microarray-plink,array_prefix,"genfile, closest",Global PLINK BED/BIM/FAM prefix used as hard genotype evidence.
+--microarray-hard-call-weight,80,"genfile confidence, closest",How strongly hard array calls are injected into read-count evidence.
+--no-microarray-add-samples,flag,no direct equivalent,Do not add PLINK-only samples missing from `samples`.
+--random-seed,7,seed,Controls stochastic initialization/jitter/subsampling behavior.
+--founder-init-jitter,0.01,"S / random starts, closest",Adds variation to uniform founder initialization.
+--memory-map-read-matrices,flag,no direct equivalent,Store large read matrices on disk to reduce resident memory.
+--compression,zstd,no direct equivalent,Parquet compression codec.
+--compression-level,6,no direct equivalent,Parquet compression level.
+--pedigree-strength,0.1,no standard CLI equivalent,Blend dosage toward pedigree/relative mean when a pedigree matrix is supplied through Python API.
+--founder-vcf,founders.vcf.gz,"reference_haplotype_file + legend/sample, closest",Founder/reference initialization from VCF.
+--founder-plink,founder_prefix,"reference haplotypes, closest",Founder/reference initialization from PLINK BED/BIM/FAM.
+--founder-immutable,flag,"reference used for initialization/not updating, closest",Freeze founder states for parity/reference-panel behavior.

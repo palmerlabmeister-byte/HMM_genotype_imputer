@@ -1,3 +1,10 @@
+from importlib.metadata import PackageNotFoundError, version as _package_version
+
+try:
+    __version__ = _package_version("stitchv2")
+except PackageNotFoundError:  # pragma: no cover - source tree before install.
+    __version__ = "0.1.0"
+
 from .calibration import (
     apply_multiclass_isotonic_calibrator,
     build_block_context_features,
@@ -75,8 +82,10 @@ from .pedigree_qc import (
     run_pedigree_qc,
 )
 from .pipeline import StitchPipeline
+from .variant_discovery import discover_snp_positions, discover_variants, empty_discovery_frame, write_discovered_positions
 
 __all__ = [
+    "__version__",
     "open_block_dataset",
     "compute_variant_diagnostics",
     "diagnostic_thresholds",
@@ -148,4 +157,8 @@ __all__ = [
     "compute_similarity",
     "load_genotype_matrix",
     "run_pedigree_qc",
+    "discover_snp_positions",
+    "discover_variants",
+    "empty_discovery_frame",
+    "write_discovered_positions",
 ]
