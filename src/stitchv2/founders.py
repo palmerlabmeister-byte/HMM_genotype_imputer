@@ -191,26 +191,18 @@ class FounderPanel:
         immutable: bool = True,
     ) -> "FounderPanel":
         try:
-            from .npplink import load_plink
+            from .microarray import _normalize_chrom, _read_plink_bim, load_microarray_hardcalls_from_plink
         except ImportError as exc:
-            raise ImportError(
-                "stitchv2.npplink (requires numpy, pandas and dask) is needed for PLINK founder input."
-            ) from exc
+            raise ImportError("STITCHV2's internal PLINK loader is required for PLINK founder input.") from exc
 
-        # Local npplink reader: bim/fam DataFrames + a lazy dask genotype array of
-        # shape (n_samples, n_variants) with hard calls 0/1/2 and np.nan for missing.
-        bim, fam, geno = load_plink(str(plink_prefix))
-        n_samples = int(geno.shape[0])
-
-        def _strip_chr(values: pd.Series) -> pd.Series:
-            return values.astype(str).str.replace("chr", "", case=False, regex=False)
-
-        chr_target = str(chromosome).replace("chr", "")
-        chr_mask = _strip_chr(bim["chrom"]) == chr_target
-        bim = bim.loc[chr_mask].copy()
-        # 'i' is the original row index in the full bim == column index in geno.
-        bim_variant_index = bim["i"].to_numpy(dtype=np.int64, copy=True)
-
+        plink_prefix = Path(plink_prefix)
+        hardcalls = load_microarray_hardcalls_from_plink(
+            plink_prefix,
+            chromosome=chromosome,
+            positions_df=positions_df,
+        )
+        bim = _read_plink_bim(plink_prefix)
+        bim = bim.loc[bim["chrom_norm"] == _normalize_chrom(chromosome)].copy()
         positions = positions_df["POS"].to_numpy(dtype=np.int64)
         ref = positions_df["REF"].fillna("N").astype(str).to_numpy()
         alt = positions_df["ALT"].fillna("N").astype(str).to_numpy()
@@ -218,29 +210,20 @@ class FounderPanel:
         if genetic_cm is None:
             genetic_cm = _interpolate_cm_from_bim(bim, positions)
 
-        pos_to_input = {int(pos): idx for idx, pos in enumerate(positions)}
-        alt_prob = np.full((n_samples, len(positions)), 0.5, dtype=np.float32)
-        if bim_variant_index.size:
-            # Materialize only the columns for this chromosome (dask -> numpy).
-            geno_chr = np.asarray(geno[:, bim_variant_index], dtype=np.float32)
-            bim_pos = bim["pos"].to_numpy(dtype=np.int64)
-            for col, pos in enumerate(bim_pos.tolist()):
-                target_idx = pos_to_input.get(int(pos))
-                if target_idx is None:
-                    continue
-                values = geno_chr[:, col] / 2.0
-                # Keep the uninformative 0.5 prior where the hard call is missing.
-                alt_prob[:, target_idx] = np.where(np.isnan(values), 0.5, values)
+        n_founders = int(hardcalls.dosage.shape[0])
+        alt_prob = np.full((n_founders, len(positions)), 0.5, dtype=np.float32)
+        values = np.asarray(hardcalls.dosage, dtype=np.float32) / 2.0
+        finite = np.isfinite(values)
+        alt_prob[finite] = np.clip(values[finite], 0.0, 1.0)
         return cls(
             chromosome=chromosome,
             positions=positions,
             ref=ref,
             alt=alt,
             alt_prob=alt_prob.astype(np.float32),
-            immutable_mask=np.full(n_samples, immutable, dtype=bool),
+            immutable_mask=np.full(n_founders, immutable, dtype=bool),
             genetic_cm=genetic_cm,
         )
-
 
 def load_founders(
     source_format: str,
