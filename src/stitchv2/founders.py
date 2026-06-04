@@ -191,40 +191,39 @@ class FounderPanel:
         immutable: bool = True,
     ) -> "FounderPanel":
         try:
-            from npplink import Plink
+            from .microarray import _normalize_chrom, _read_plink_bim, load_microarray_hardcalls_from_plink
         except ImportError as exc:
-            raise ImportError("npplink is required for PLINK founder input.") from exc
+            raise ImportError("STITCHV2's internal PLINK loader is required for PLINK founder input.") from exc
 
-        plink = Plink(str(plink_prefix))
-        bim = plink.get_bim()
-        chr_mask = bim["chrom"].astype(str) == str(chromosome).replace("chr", "")
-        bim = bim.loc[chr_mask].copy()
-        bim_variant_index = bim.index.to_numpy(dtype=np.int64, copy=True)
-        bim = bim.reset_index(drop=True)
-        geno = plink.get_geno()
+        plink_prefix = Path(plink_prefix)
+        hardcalls = load_microarray_hardcalls_from_plink(
+            plink_prefix,
+            chromosome=chromosome,
+            positions_df=positions_df,
+        )
+        bim = _read_plink_bim(plink_prefix)
+        bim = bim.loc[bim["chrom_norm"] == _normalize_chrom(chromosome)].copy()
         positions = positions_df["POS"].to_numpy(dtype=np.int64)
         ref = positions_df["REF"].fillna("N").astype(str).to_numpy()
         alt = positions_df["ALT"].fillna("N").astype(str).to_numpy()
         genetic_cm = _genetic_cm_from_positions_df(positions_df)
         if genetic_cm is None:
             genetic_cm = _interpolate_cm_from_bim(bim, positions)
-        pos_to_input = {int(pos): idx for idx, pos in enumerate(positions)}
-        alt_prob = np.full((geno.shape[0], len(positions)), 0.5, dtype=np.float32)
-        for bim_idx, pos in zip(bim_variant_index.tolist(), bim["pos"].to_numpy(dtype=np.int64), strict=False):
-            target_idx = pos_to_input.get(int(pos))
-            if target_idx is None:
-                continue
-            alt_prob[:, target_idx] = geno[:, int(bim_idx)] / 2.0
+
+        n_founders = int(hardcalls.dosage.shape[0])
+        alt_prob = np.full((n_founders, len(positions)), 0.5, dtype=np.float32)
+        values = np.asarray(hardcalls.dosage, dtype=np.float32) / 2.0
+        finite = np.isfinite(values)
+        alt_prob[finite] = np.clip(values[finite], 0.0, 1.0)
         return cls(
             chromosome=chromosome,
             positions=positions,
             ref=ref,
             alt=alt,
             alt_prob=alt_prob.astype(np.float32),
-            immutable_mask=np.full(geno.shape[0], immutable, dtype=bool),
+            immutable_mask=np.full(n_founders, immutable, dtype=bool),
             genetic_cm=genetic_cm,
         )
-
 
 def load_founders(
     source_format: str,
