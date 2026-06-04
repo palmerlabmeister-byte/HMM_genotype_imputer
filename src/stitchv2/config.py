@@ -82,6 +82,11 @@ class HMMConfig:
     backend_autotune: bool = True
     autotune_samples: int = 0
     autotune_positions: int = 0
+    # Fraction of free GPU memory the JAX sample-batch auto-sizer is allowed to
+    # target when ``jax_sample_batch_size <= 0``. Only used when a GPU/TPU is
+    # present and device memory can be queried; otherwise all samples are run in
+    # one batch (previous behaviour).
+    gpu_memory_fraction: float = 0.85
 
 
 @dataclass(slots=True)
@@ -140,6 +145,7 @@ class PipelineConfig:
     jax_count_emission_kernel: bool = True
     jax_fragment_emission_kernel: bool = True
     jax_persistent_cache_dir: str | Path | None = None
+    gpu_memory_fraction: float = 0.85
     force_generic_ploidy_hmm: bool = False
     use_quality_weights: bool = True
     use_fragment_likelihood: bool = True
@@ -172,6 +178,12 @@ class PipelineConfig:
     read_batch_size: int = 1024
     io_workers: int = 1
     htslib_threads_per_file: int = 1
+    # Total CPU threads to devote to BAM reading. When > 0 this is split across
+    # ``io_workers`` (parallel samples) and ``htslib_threads_per_file`` (parallel
+    # BGZF decompression) at runtime, accounting for the Dask reservation so the
+    # machine is neither idle nor oversubscribed. 0 keeps the explicit values
+    # above. Use -1 to auto-derive from os.cpu_count().
+    io_threads_total: int = 0
     memory_map_read_matrices: bool = False
     memory_map_dir: str | Path | None = None
     compact_evidence_cache_dir: str | Path | None = None
@@ -344,6 +356,7 @@ class PipelineConfig:
             jax_count_emission_kernel=self.jax_count_emission_kernel,
             jax_fragment_emission_kernel=self.jax_fragment_emission_kernel,
             jax_persistent_cache_dir=self.jax_persistent_cache_dir,
+            gpu_memory_fraction=self.gpu_memory_fraction,
             force_generic_ploidy_hmm=self.force_generic_ploidy_hmm,
             use_quality_weights=self.use_quality_weights,
             use_fragment_likelihood=self.use_fragment_likelihood,

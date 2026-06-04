@@ -98,6 +98,37 @@ def _jax_accelerator_count() -> int:
         return 0
 
 
+def _resolve_io_threads(config: PipelineConfig) -> tuple[int, int]:
+    """Resolve (io_workers, htslib_threads_per_file) for BAM reading.
+
+    ``io_threads_total`` is the user-facing knob:
+      * 0  -> keep the explicit io_workers / htslib_threads_per_file (default).
+      * >0 -> treat as the total read-thread budget for this process.
+      * <0 -> auto-derive from os.cpu_count(), reserving the cores already
+              claimed by the Dask compute pool so reads do not oversubscribe.
+
+    The budget is split as io_workers * htslib_threads_per_file ~= total,
+    honoring any explicit htslib_threads_per_file and filling the remainder with
+    parallel-sample workers (which scale across cores in the compiled HTSlib
+    backend; the pure-Python path is GIL-bound and will not scale as well).
+    """
+    io_workers = max(int(config.io_workers), 1)
+    htslib = max(int(config.htslib_threads_per_file), 1)
+    total = int(getattr(config, "io_threads_total", 0) or 0)
+    if total == 0:
+        return io_workers, htslib
+    if total < 0:
+        cpu = int(os.cpu_count() or 1)
+        if str(config.executor) == "dask":
+            workers = int(config.dask_n_workers) or max(1, min(cpu, 4))
+            total = max(1, cpu // max(workers, 1))
+        else:
+            total = max(1, cpu)
+    total = max(1, total)
+    io_workers = max(1, total // htslib)
+    return io_workers, htslib
+
+
 def _system_memory_bytes() -> int:
     try:
         return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
@@ -298,8 +329,8 @@ class StitchPipeline:
             bx_tag=config.bx_tag,
             bx_tag_upper_limit=config.bx_tag_upper_limit,
             read_batch_size=config.read_batch_size,
-            io_workers=config.io_workers,
-            htslib_threads_per_file=config.htslib_threads_per_file,
+            io_workers=_resolve_io_threads(config)[0],
+            htslib_threads_per_file=_resolve_io_threads(config)[1],
             io_window_size=config.io_window_size,
             memory_map_read_matrices=config.memory_map_read_matrices,
             memory_map_dir=config.memory_map_dir,
@@ -402,8 +433,8 @@ class StitchPipeline:
             bx_tag=self.config.bx_tag,
             bx_tag_upper_limit=self.config.bx_tag_upper_limit,
             read_batch_size=self.config.read_batch_size,
-            io_workers=self.config.io_workers,
-            htslib_threads_per_file=self.config.htslib_threads_per_file,
+            io_workers=_resolve_io_threads(self.config)[0],
+            htslib_threads_per_file=_resolve_io_threads(self.config)[1],
             io_window_size=max(int(block.row_stop) - int(block.row_start), 1),
             memory_map_read_matrices=self.config.memory_map_read_matrices,
             memory_map_dir=self.config.memory_map_dir,

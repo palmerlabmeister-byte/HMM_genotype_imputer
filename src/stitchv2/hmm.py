@@ -60,6 +60,32 @@ def _gpu_available() -> bool:
         return False
 
 
+def _gpu_free_bytes() -> int:
+    """Best-effort free device memory in bytes for the first GPU/TPU.
+
+    Returns 0 when JAX is unavailable, no accelerator is present, or the device
+    does not expose ``memory_stats`` (e.g. CPU backend, older jaxlib). Callers
+    must treat 0 as "unknown" and fall back to their default behaviour.
+    """
+    if jax is None:
+        return 0
+    try:
+        devices = [d for d in jax.devices() if d.platform in {"gpu", "tpu"}]
+    except Exception:
+        return 0
+    if not devices:
+        return 0
+    try:
+        stats = devices[0].memory_stats() or {}
+    except Exception:
+        return 0
+    limit = int(stats.get("bytes_limit", 0) or 0)
+    in_use = int(stats.get("bytes_in_use", 0) or 0)
+    if limit <= 0:
+        return 0
+    return max(int(limit) - int(in_use), 0)
+
+
 def _torch_available() -> bool:
     return torch is not None
 
@@ -4147,8 +4173,75 @@ class JAXStitchHMM:
             denominator=denominator,
         )
 
-    def _resolve_jax_sample_batch_size(self, n_samples: int) -> int:
+    def _estimate_gpu_bytes_per_sample(self, n_positions: int, k: int) -> int:
+        """Rough on-device byte cost of one sample's forward-backward pass.
+
+        Dominated by the per-position state tensors materialised inside the
+        vmap'd kernel (emission + alpha + beta + gamma + scratch). Diploid uses
+        a k*k state; pseudo-haploid uses k. Deliberately conservative.
+        """
+        n_positions = max(int(n_positions), 1)
+        k = max(int(k), 1)
+        if self.config.ploidy_mode == "pseudo_haploid":
+            state_cells = n_positions * k
+        else:
+            state_cells = n_positions * k * k
+        copies = 6  # emission + alpha + beta + gamma + transient scratch
+        per_sample = int(state_cells) * 4 * copies
+        # observation/output overhead: ref/alt/other obs, dosage, genotype
+        # posterior, and haplotype posterior (~k per position).
+        per_sample += n_positions * 4 * (k + 8)
+        return max(per_sample, 1)
+
+    def _gpu_auto_sample_batch_size(
+        self,
+        n_samples: int,
+        n_positions: int | None,
+        k: int | None,
+    ) -> int:
+        """Largest sample batch that fits ``gpu_memory_fraction`` of free VRAM.
+
+        Returns ``n_samples`` (i.e. "no constraint") whenever the device memory
+        cannot be determined, so the previous all-samples-at-once behaviour is
+        preserved on CPU backends or older jaxlib without ``memory_stats``.
+        """
+        if n_positions is None or k is None:
+            return n_samples
+        free = _gpu_free_bytes()
+        if free <= 0:
+            return n_samples
+        frac = min(max(float(self.config.gpu_memory_fraction), 0.05), 0.95)
+        budget = int(free * frac)
+        per_sample = self._estimate_gpu_bytes_per_sample(int(n_positions), int(k))
+        auto = int(budget // max(per_sample, 1))
+        if auto < 1:
+            return 1
+        return min(auto, int(n_samples))
+
+    def _block_obs_fits_device(self, n_samples: int, n_positions: int) -> bool:
+        """Whether the full block's dense observation arrays fit comfortably on
+        the GPU so they can be uploaded once and sliced per batch (avoiding a
+        host->device copy every sample batch). Conservative: returns False when
+        device memory is unknown, leaving the previous per-batch upload path.
+        """
+        free = _gpu_free_bytes()
+        if free <= 0:
+            return False
+        # ref/alt/other obs + switch + sample_alt_fraction (~6 float32 arrays of
+        # shape (n_samples, n_positions)).
+        obs_bytes = int(n_samples) * int(n_positions) * 4 * 6
+        return obs_bytes < 0.25 * float(free)
+
+    def _resolve_jax_sample_batch_size(
+        self,
+        n_samples: int,
+        n_positions: int | None = None,
+        k: int | None = None,
+    ) -> int:
+        n_samples = int(n_samples)
         batch = int(self.config.jax_sample_batch_size)
+        if batch <= 0:
+            batch = self._gpu_auto_sample_batch_size(n_samples, n_positions, k)
         if batch <= 0 or batch >= n_samples:
             return n_samples
         if bool(self.config.jax_bucket_batch_shapes) and n_samples % batch != 0:
@@ -5047,9 +5140,9 @@ class JAXStitchHMM:
                     )
                 )
             ):
-                batch_size = self._resolve_jax_sample_batch_size(n_samples)
-                numerator = np.zeros((k, n_positions), dtype=np.float32)
-                denominator = np.zeros((k, n_positions), dtype=np.float32)
+                batch_size = self._resolve_jax_sample_batch_size(n_samples, n_positions, k)
+                numerator_dev = jnp.zeros((k, n_positions), dtype=jnp.float32)
+                denominator_dev = jnp.zeros((k, n_positions), dtype=jnp.float32)
                 founder_alt_f32 = working_alt_prob.astype(np.float32, copy=False)
                 founder_alt_jax = jnp.asarray(founder_alt_f32, dtype=jnp.float32)
                 transition_factor_offdiag_jax = (
@@ -5069,7 +5162,7 @@ class JAXStitchHMM:
                 )
                 fragment_rescale_jax = jnp.asarray(bool(self.config.fragment_rescale_read_likelihood), dtype=jnp.bool_)
                 fragment_replace_jax = jnp.asarray(self.config.fragment_likelihood_mode == "replace", dtype=jnp.bool_)
-                preload_block_on_device = batch_size >= n_samples
+                preload_block_on_device = batch_size >= n_samples or self._block_obs_fits_device(n_samples, n_positions)
                 if preload_block_on_device:
                     ref_obs_all_jax = jnp.asarray(ref_obs_all, dtype=jnp.float32)
                     alt_obs_all_jax = jnp.asarray(alt_obs_all, dtype=jnp.float32)
@@ -5211,9 +5304,8 @@ class JAXStitchHMM:
                                     fragment_rescale_jax,
                                     fragment_replace_jax,
                                 )
-                                jax.block_until_ready((numerator_jax, denominator_jax, dosage_batch_jax, gp_batch_jax))
-                                numerator += np.asarray(numerator_jax, dtype=np.float32)
-                                denominator += np.asarray(denominator_jax, dtype=np.float32)
+                                numerator_dev = numerator_dev + numerator_jax
+                                denominator_dev = denominator_dev + denominator_jax
                         elif all_founders_immutable:
                             fn = self._get_jax_haploid_count_output_callable(n_batch, n_positions, k)
                             hap_gamma_jax, dosage_batch_jax, gp_batch_jax = fn(
@@ -5244,9 +5336,8 @@ class JAXStitchHMM:
                                 sequencing_error_rate_jax,
                                 min_emission_prob_jax,
                             )
-                            jax.block_until_ready((numerator_jax, denominator_jax, dosage_batch_jax, gp_batch_jax))
-                            numerator += np.asarray(numerator_jax, dtype=np.float32)
-                            denominator += np.asarray(denominator_jax, dtype=np.float32)
+                            numerator_dev = numerator_dev + numerator_jax
+                            denominator_dev = denominator_dev + denominator_jax
                         dosage[sample_start:sample_stop] = np.asarray(dosage_batch_jax, dtype=np.float32)
                         if return_haplotype_posterior and haplotype_posterior is not None:
                             haplotype_posterior[sample_start:sample_stop] = np.asarray(hap_gamma_jax, dtype=np.float32)
@@ -5303,9 +5394,10 @@ class JAXStitchHMM:
                                 sequencing_error_rate_jax,
                                 min_emission_prob_jax,
                             )
-                        jax.block_until_ready((numerator_jax, denominator_jax))
-                        numerator += np.asarray(numerator_jax, dtype=np.float32)
-                        denominator += np.asarray(denominator_jax, dtype=np.float32)
+                        numerator_dev = numerator_dev + numerator_jax
+                        denominator_dev = denominator_dev + denominator_jax
+                numerator = np.asarray(numerator_dev, dtype=np.float32)
+                denominator = np.asarray(denominator_dev, dtype=np.float32)
                 if not all_founders_immutable and not is_last_iteration:
                     previous_alt_prob = working_alt_prob
                     working_alt_prob = self._update_founders_from_stats(
@@ -5354,9 +5446,9 @@ class JAXStitchHMM:
                     or transition_factor_offdiag is not None
                 )
             ):
-                batch_size = self._resolve_jax_sample_batch_size(n_samples)
-                numerator = np.zeros((k, n_positions), dtype=np.float32)
-                denominator = np.zeros((k, n_positions), dtype=np.float32)
+                batch_size = self._resolve_jax_sample_batch_size(n_samples, n_positions, k)
+                numerator_dev = jnp.zeros((k, n_positions), dtype=jnp.float32)
+                denominator_dev = jnp.zeros((k, n_positions), dtype=jnp.float32)
                 founder_alt_f32 = working_alt_prob.astype(np.float32, copy=False)
                 founder_alt_jax = jnp.asarray(founder_alt_f32, dtype=jnp.float32)
                 transition_factor_offdiag_jax = (
@@ -5376,7 +5468,7 @@ class JAXStitchHMM:
                 )
                 fragment_rescale_jax = jnp.asarray(bool(self.config.fragment_rescale_read_likelihood), dtype=jnp.bool_)
                 fragment_replace_jax = jnp.asarray(self.config.fragment_likelihood_mode == "replace", dtype=jnp.bool_)
-                preload_block_on_device = batch_size >= n_samples
+                preload_block_on_device = batch_size >= n_samples or self._block_obs_fits_device(n_samples, n_positions)
                 if preload_block_on_device:
                     ref_obs_all_jax = jnp.asarray(ref_obs_all, dtype=jnp.float32)
                     alt_obs_all_jax = jnp.asarray(alt_obs_all, dtype=jnp.float32)
@@ -5541,9 +5633,8 @@ class JAXStitchHMM:
                                 fragment_rescale_jax,
                                 fragment_replace_jax,
                             )
-                            jax.block_until_ready((numerator_jax, denominator_jax, dosage_batch_jax, gp_batch_jax))
-                            numerator += np.asarray(numerator_jax, dtype=np.float32)
-                            denominator += np.asarray(denominator_jax, dtype=np.float32)
+                            numerator_dev = numerator_dev + numerator_jax
+                            denominator_dev = denominator_dev + denominator_jax
                         elif use_plain_count_kernel and all_founders_immutable:
                             fn = self._get_jax_diploid_count_output_callable(n_batch, n_positions, k)
                             hap_gamma_jax, dosage_batch_jax, gp_batch_jax = fn(
@@ -5574,9 +5665,8 @@ class JAXStitchHMM:
                                 sequencing_error_rate_jax,
                                 min_emission_prob_jax,
                             )
-                            jax.block_until_ready((numerator_jax, denominator_jax, dosage_batch_jax, gp_batch_jax))
-                            numerator += np.asarray(numerator_jax, dtype=np.float32)
-                            denominator += np.asarray(denominator_jax, dtype=np.float32)
+                            numerator_dev = numerator_dev + numerator_jax
+                            denominator_dev = denominator_dev + denominator_jax
                         else:
                             log_emission_batch, _, founder_alt = self.emissions(
                                 working_alt_prob,
@@ -5647,9 +5737,8 @@ class JAXStitchHMM:
                                         sample_alt_fraction_batch_jax,
                                         founder_alt_jax,
                                     )
-                                jax.block_until_ready((numerator_jax, denominator_jax, dosage_batch_jax, gp_batch_jax))
-                                numerator += np.asarray(numerator_jax, dtype=np.float32)
-                                denominator += np.asarray(denominator_jax, dtype=np.float32)
+                                numerator_dev = numerator_dev + numerator_jax
+                                denominator_dev = denominator_dev + denominator_jax
                         dosage[sample_start:sample_stop] = np.asarray(dosage_batch_jax, dtype=np.float32)
                         if return_haplotype_posterior and haplotype_posterior is not None:
                             haplotype_posterior[sample_start:sample_stop] = np.asarray(hap_gamma_jax, dtype=np.float32)
@@ -5746,10 +5835,11 @@ class JAXStitchHMM:
                                     switch_batch_jax,
                                     sample_alt_fraction_batch_jax,
                                 )
-                        jax.block_until_ready((numerator_jax, denominator_jax))
-                        numerator += np.asarray(numerator_jax, dtype=np.float32)
-                        denominator += np.asarray(denominator_jax, dtype=np.float32)
+                        numerator_dev = numerator_dev + numerator_jax
+                        denominator_dev = denominator_dev + denominator_jax
 
+                numerator = np.asarray(numerator_dev, dtype=np.float32)
+                denominator = np.asarray(denominator_dev, dtype=np.float32)
                 if not all_founders_immutable and not is_last_iteration:
                     previous_alt_prob = working_alt_prob
                     working_alt_prob = self._update_founders_from_stats(

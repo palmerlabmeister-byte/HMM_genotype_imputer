@@ -290,6 +290,13 @@ def _add_common_run_args(parser: argparse.ArgumentParser, *, require_n_founders:
     parser.add_argument("--downsample-fraction", type=float, default=1.0, help="Random fragment retention fraction before HMM.")
     parser.add_argument("--io-workers", type=int, default=1)
     parser.add_argument("--htslib-threads-per-file", type=int, default=1)
+    parser.add_argument(
+        "--io-threads-total",
+        type=int,
+        default=0,
+        help="Total BAM-read thread budget (split across io-workers x htslib-threads-per-file). "
+        "0=use explicit values; <0=auto from CPU count minus the Dask reservation.",
+    )
     parser.add_argument("--compact-evidence-cache-dir", default="", help="Optional directory for compact fragment-evidence cache files.")
     parser.add_argument(
         "--compact-evidence-cache-mode",
@@ -619,6 +626,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         downsample_fraction=downsample_fraction,
         io_workers=args.io_workers,
         htslib_threads_per_file=args.htslib_threads_per_file,
+        io_threads_total=args.io_threads_total,
         compact_evidence_cache_dir=(args.compact_evidence_cache_dir if args.compact_evidence_cache_dir else None),
         compact_evidence_cache_mode=args.compact_evidence_cache_mode,
         compact_evidence_cache_format=args.compact_evidence_cache_format,
@@ -957,6 +965,7 @@ def cmd_tune_jax_memory(args: argparse.Namespace) -> None:
                     read_stream_backend=args.read_stream_backend,
                     io_workers=args.io_workers,
                     htslib_threads_per_file=args.htslib_threads_per_file,
+                    io_threads_total=args.io_threads_total,
                     hmm_backend="jax",
                     jax_sample_batch_size=jax_batch_size,
                     use_fragment_likelihood=True,
