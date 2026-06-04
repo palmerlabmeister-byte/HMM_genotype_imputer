@@ -25,7 +25,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plink = ["npplink>=0.3"]
+# PLINK founder input is handled by the bundled stitchv2.npplink reader
+# (needs only numpy/pandas/dask, all core deps) -- no external package required.
+# Install this extra to speed up the optional GRM/GWAS helpers in stitchv2.npplink.
+npplink = ["numba>=0.59", "tqdm>=4.66"]
 ml = ["optuna>=3.6"]
 plot = ["umap-learn>=0.5", "hvplot>=0.10", "holoviews>=1.18", "panel>=1.4", "bokeh>=3.4"]
 jobqueue = ["dask-jobqueue>=0.9"]

@@ -4,13 +4,38 @@ import dask
 import xarray as xr
 import pandas as pd
 import pyarrow.dataset as ds
-import dask.dataframe as dd
-import numba
+
+try:  # numba is optional; PLINK reading does not need it. The GRM/GWAS helpers
+    # fall back to pure-Python (slower) when numba is unavailable.
+    import numba
+    from numba import njit, prange
+except Exception:  # pragma: no cover - exercised only without numba installed.
+    import types as _types
+
+    def njit(*args, **kwargs):
+        # Support both @njit and @njit(...) decorator usage.
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def _wrap(fn):
+            return fn
+
+        return _wrap
+
+    prange = range
+    numba = _types.SimpleNamespace(njit=njit, prange=prange)
+
 from sklearn.utils.extmath import randomized_svd
 from scipy.stats import t as scipyt
 from scipy.stats import chi2
 from scipy.special import stdtr, erfc
-from tqdm import tqdm
+
+try:  # tqdm is optional; used only for progress bars in the GRM/GWAS helpers.
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - exercised only without tqdm installed.
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else []
+
 import itertools
 from typing import Literal
 from scipy.linalg import blas
@@ -972,7 +997,7 @@ def R2(X, Y= None, return_named = True, return_square = True, statistic = 'r2', 
             res['distance'] = (res.bp1.str.slice(start=pos).astype(int)  - res.bp2.str.slice(start=pos).astype(int)).abs()
     return res
 
-from numba import njit, prange
+# njit / prange are imported (or stubbed) at module top.
 @njit(parallel=True, fastmath=False)
 def _cityblock_distance(X, Y, axis = 'rows', dtype = np.float32, scale = True):
     if axis == 'columns': 
