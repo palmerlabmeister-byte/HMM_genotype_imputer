@@ -1,9 +1,9 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "numpy>=1.25"]
+requires = ["setuptools>=68", "wheel", "numpy>=1.25", "pybind11>=2.12"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stitchv2"
+name = "stitchcont"
 version = "0.1.0"
 description = "Streaming STITCH-style low-coverage imputation in Python/JAX."
 readme = "README.md"
@@ -20,22 +20,28 @@ dependencies = [
   "lightgbm>=4.0",
   "xarray>=2024.3.0",
   "zarr>=2.18",
+  "numcodecs>=0.12",
   "dask[array]>=2024.3.0",
   "distributed>=2024.3.0",
 ]
 
 [project.optional-dependencies]
+cpu = ["numba>=0.59", "pybind11>=2.12"]
 plink = ["npplink>=0.3"]
 ml = ["optuna>=3.6"]
 plot = ["umap-learn>=0.5", "hvplot>=0.10", "holoviews>=1.18", "panel>=1.4", "bokeh>=3.4"]
 jobqueue = ["dask-jobqueue>=0.9"]
 dev = ["pytest>=8.0"]
+cuda12 = ["jax[cuda12]>=0.4.28"]
 
 [project.scripts]
-stitchv2 = "stitchv2.cli:main"
+stitchcont = "stitchcont.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+stitchcont = ["native/*.cpp", "native/*.hpp"]
